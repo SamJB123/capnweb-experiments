@@ -1,8 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch",
-      "WebFetch(domain:developers.cloudflare.com)"
+      "Bash(node -e:*)",
+      "Bash(npx vitest:*)"
     ]
   }
 }
