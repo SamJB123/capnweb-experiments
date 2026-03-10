@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { unstable_dev } from "wrangler";
 import type { UnstableDevWorker } from "wrangler";
 import { WebSocket } from "ws";
-import { RpcTarget, newWebSocketRpcSession, __experimental_debugRpcReference } from "../src/index.ts";
+import { RpcStub, RpcTarget, newWebSocketRpcSession, __experimental_debugRpcReference } from "../src/index.ts";
 
 let worker: UnstableDevWorker;
 
@@ -438,7 +438,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
       const rebuiltExport = findDurableCounterExport(afterAttempt, key);
       expect(rebuiltExport).toBeDefined();
       expect(rebuiltExport.hasHook).toBe(true);
-      expect(rebuiltExport.hookType).toBe("TargetStubHook");
+      expect(rebuiltExport.hookType).toBe("PromiseStubHook");
       expect(rebuiltExport.provenance?.expr).toEqual(["pipeline", 0, ["getDurableCounter"], [key]]);
       logSideBySide(
           "after first post-wake use: root vs bootstrap export",
@@ -645,7 +645,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
     const ws = await connectWebSocket();
     try {
       const root = newWebSocketRpcSession<any>(ws as any);
-      const callback = new ClientCallback();
+      const callback = new RpcStub(new ClientCallback());
       const callbackName = uniqueKey("client-callback");
 
       expect(await root.storeClientCallback(callbackName, callback)).toBe(1);
@@ -660,6 +660,40 @@ describe("real hibernatable DO with capnweb RPC", () => {
       const afterDiagnostics = await getResumeDiagnostics();
       expect(afterDiagnostics.counters.restoreAttempts).toBeGreaterThan(0);
       expect(afterDiagnostics.counters.restoreSuccesses).toBeGreaterThan(0);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it("stored client callback survives hibernation and can be invoked after wake", { timeout: 30_000 }, async () => {
+    class ClientCallback extends RpcTarget {
+      notifications: string[] = [];
+
+      notify(message: string) {
+        this.notifications.push(message);
+        return { ok: true, count: this.notifications.length };
+      }
+    }
+
+    const ws = await connectWebSocket();
+    try {
+      const root = newWebSocketRpcSession<any>(ws as any);
+      const callbackTarget = new ClientCallback();
+      const callback = new RpcStub(callbackTarget);
+      const callbackName = uniqueKey("client-callback-survive");
+
+      expect(await root.storeClientCallback(callbackName, callback)).toBe(1);
+      expect(await root.getStoredClientCallbackCount()).toBe(1);
+
+      const idBefore = await root.getInstanceId();
+      await waitForHibernation(idBefore);
+
+      expect(await root.getStoredClientCallbackCount()).toBe(1);
+      expect(await withTimeout(root.invokeStoredClientCallback(callbackName, "after-wake"))).toEqual({
+        ok: true,
+        count: 1,
+      });
+      expect(callbackTarget.notifications).toEqual(["after-wake"]);
     } finally {
       ws.close();
     }

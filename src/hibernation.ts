@@ -42,6 +42,10 @@ export type RpcSessionSnapshot = {
    *  Only unresolved imports are snapshotted — resolved imports have already
    *  sent a release to the peer and are handled locally. */
   imports?: RpcSessionSnapshotImport[];
+  /** Replayable inbound calls that introduced imported capabilities into local
+   *  application state. Replaying these after restore rebuilds app-held
+   *  references without requiring application-layer persistence. */
+  importReplays?: RpcSessionExportProvenance[];
 };
 
 /**

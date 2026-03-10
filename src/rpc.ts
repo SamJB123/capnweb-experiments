@@ -6,6 +6,7 @@ import {
   StubHook,
   RpcPayload,
   RpcStub,
+  RpcPromise,
   PropertyPath,
   PayloadStubHook,
   ErrorStubHook,
@@ -319,6 +320,22 @@ class RpcImportHook extends StubHook {
   }
 }
 
+export function __experimental_getImportIdForRpcValue(value: unknown): number | undefined {
+  if (!(value instanceof RpcStub) && !(value instanceof RpcPromise)) {
+    return undefined;
+  }
+
+  const { hook, pathIfPromise } = unwrapStubAndPath(value);
+  if (pathIfPromise && pathIfPromise.length > 0) {
+    return undefined;
+  }
+  if (!(hook instanceof RpcImportHook)) {
+    return undefined;
+  }
+
+  return hook.getEntry().importId;
+}
+
 class RpcMainHook extends RpcImportHook {
   private session?: RpcSessionImpl;
 
@@ -400,6 +417,7 @@ class RpcSessionImpl implements Importer, Exporter {
   private exports: Array<ExportTableEntry> = [];
   private reverseExports: Map<StubHook, ExportId> = new Map();
   private imports: Array<ImportTableEntry> = [];
+  private importReplays: RpcSessionExportProvenance[] = [];
   private abortReason?: any;
   private cancelReadLoop: (error: any) => void;
 
@@ -742,6 +760,7 @@ class RpcSessionImpl implements Importer, Exporter {
       nextExportId: this.nextExportId,
       exports,
       ...(imports.length > 0 ? {imports} : {}),
+      ...(this.importReplays.length > 0 ? { importReplays: this.importReplays } : {}),
     };
   }
 
@@ -977,6 +996,13 @@ class RpcSessionImpl implements Importer, Exporter {
           case "push":  // ["push", ImportId, Expression]
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
+              if (containsImportedCapabilityReference(msg[2])) {
+                this.importReplays.push({ expr: structuredClone(msg[2]) });
+                this.trace("readLoop.push.recordImportReplay", {
+                  exportId,
+                  replayCount: this.importReplays.length,
+                });
+              }
               let payload = new Evaluator(this).evaluate(msg[2]);
               let hook = new PayloadStubHook(payload);
 
@@ -988,7 +1014,6 @@ class RpcSessionImpl implements Importer, Exporter {
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
-                provenance: { expr: structuredClone(msg[2]) },
               });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
@@ -1010,7 +1035,6 @@ class RpcSessionImpl implements Importer, Exporter {
                 hook,
                 refcount: 1,
                 autoRelease: true,
-                provenance: { expr: structuredClone(msg[2]) },
               });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
 
@@ -1269,6 +1293,24 @@ class RpcSessionImpl implements Importer, Exporter {
       }
     }
 
+    if (snapshot.importReplays && snapshot.importReplays.length > 0) {
+      this.importReplays = snapshot.importReplays.map(replay => ({
+        expr: structuredClone(replay.expr),
+        ...(replay.captures ? { captures: structuredClone(replay.captures) } : {}),
+        ...(replay.instructions ? { instructions: structuredClone(replay.instructions) } : {}),
+        ...(replay.path ? { path: structuredClone(replay.path) } : {}),
+      }));
+      for (let replay of this.importReplays) {
+        this.trace("restoreFromSnapshot.importReplay.begin", {
+          hasCaptures: !!replay.captures?.length,
+          instructionCount: replay.instructions?.length ?? 0,
+          pathLength: replay.path?.length ?? 0,
+        });
+        let payload = new Evaluator(this).evaluate(structuredClone(replay.expr));
+        payload.dispose();
+      }
+    }
+
     if (pendingPulls.length > 0) {
       queueMicrotask(() => {
         for (let id of pendingPulls) {
@@ -1277,6 +1319,38 @@ class RpcSessionImpl implements Importer, Exporter {
       });
     }
   }
+
+  __experimental_getImportedStub(importId: number): RpcStub {
+    const entry = this.imports[importId];
+    if (!entry) {
+      throw new Error(`no such import ID: ${importId}`);
+    }
+    return new RpcStub(new RpcImportHook(false, entry));
+  }
+}
+
+function containsImportedCapabilityReference(value: unknown): boolean {
+  if (!(value instanceof Array)) {
+    if (value && typeof value === "object") {
+      for (let nested of Object.values(value as Record<string, unknown>)) {
+        if (containsImportedCapabilityReference(nested)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  if (value.length > 0 && (value[0] === "export" || value[0] === "promise")) {
+    return true;
+  }
+
+  for (let nested of value) {
+    if (containsImportedCapabilityReference(nested)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Public interface that wraps RpcSession and hides private implementation details (even from
@@ -1314,5 +1388,9 @@ export class RpcSession {
 
   __experimental_debugState(): RpcSessionDebugState {
     return this.#session.__experimental_debugState();
+  }
+
+  __experimental_getImportedStub(importId: number): RpcStub {
+    return this.#session.__experimental_getImportedStub(importId);
   }
 }
