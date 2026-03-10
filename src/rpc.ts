@@ -58,6 +58,10 @@ type ExportTableEntry = {
   hook?: StubHook,
   refcount: number,
   provenance?: RpcSessionExportProvenance,
+  // Transient origin expression for positive exports. This is not snapshotted, but it is used
+  // while resolving a positive export so any negative exports found in its result can inherit
+  // provenance from the originating call.
+  sourceExpr?: unknown,
   pull?: Promise<void>,
 
   // If true, the export should be automatically released (with refcount 1) after its "resolve"
@@ -413,6 +417,19 @@ export type RpcSessionDebugState = {
   }>;
 };
 
+function cloneRpcExpr<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function cloneRpcProvenance(provenance: RpcSessionExportProvenance): RpcSessionExportProvenance {
+  return {
+    expr: cloneRpcExpr(provenance.expr),
+    ...(provenance.captures ? { captures: cloneRpcExpr(provenance.captures) } : {}),
+    ...(provenance.instructions ? { instructions: cloneRpcExpr(provenance.instructions) } : {}),
+    ...(provenance.path ? { path: cloneRpcExpr(provenance.path) } : {}),
+  };
+}
+
 class RpcSessionImpl implements Importer, Exporter {
   private exports: Array<ExportTableEntry> = [];
   private reverseExports: Map<StubHook, ExportId> = new Map();
@@ -468,6 +485,16 @@ class RpcSessionImpl implements Importer, Exporter {
     }
   }
 
+  private evaluateWithCurrentProvenance(expr: unknown): RpcPayload {
+    const previousExpr = this.currentNegativeExportProvenanceExpr;
+    this.currentNegativeExportProvenanceExpr = expr;
+    try {
+      return new Evaluator(this).evaluate(expr);
+    } finally {
+      this.currentNegativeExportProvenanceExpr = previousExpr;
+    }
+  }
+
   // Should only be called once immediately after construction.
   getMainImport(): RpcImportHook {
     return new RpcMainHook(this.imports[0]);
@@ -496,7 +523,7 @@ class RpcSessionImpl implements Importer, Exporter {
           provenance: (() => {
             let mapProgram = __experimental_recordInputPath(path ?? []);
             return {
-              expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+              expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
               captures: mapProgram.captures,
               instructions: mapProgram.instructions,
             };
@@ -522,7 +549,7 @@ class RpcSessionImpl implements Importer, Exporter {
         provenance: (() => {
           let mapProgram = __experimental_recordInputPath(path ?? []);
           return {
-            expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+            expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
             captures: mapProgram.captures,
             instructions: mapProgram.instructions,
           };
@@ -629,7 +656,7 @@ class RpcSessionImpl implements Importer, Exporter {
       exp.pull = resolve().then(
         payload => {
           const previousExpr = this.currentNegativeExportProvenanceExpr;
-          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr;
+          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr ?? exp.sourceExpr;
           // We don't transfer ownership of stubs in the payload since the payload
           // belongs to the hook which sticks around to handle pipelined requests.
           let value: unknown;
@@ -998,12 +1025,13 @@ class RpcSessionImpl implements Importer, Exporter {
               let exportId = msg[1];
               if (containsImportedCapabilityReference(msg[2])) {
                 this.importReplays.push({ expr: structuredClone(msg[2]) });
+                this.importReplays.push({ expr: cloneRpcExpr(msg[2]) });
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
                   replayCount: this.importReplays.length,
                 });
               }
-              let payload = new Evaluator(this).evaluate(msg[2]);
+              let payload = this.evaluateWithCurrentProvenance(msg[2]);
               let hook = new PayloadStubHook(payload);
 
               // It's possible for a rejection to occur before the client gets a chance to send
@@ -1014,6 +1042,7 @@ class RpcSessionImpl implements Importer, Exporter {
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
+                sourceExpr: cloneRpcExpr(msg[2]),
               });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
@@ -1027,13 +1056,14 @@ class RpcSessionImpl implements Importer, Exporter {
             // - Once the "resolve" is sent, the export is implicitly released.
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
-              let payload = new Evaluator(this).evaluate(msg[2]);
+              let payload = this.evaluateWithCurrentProvenance(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
 
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
+                sourceExpr: cloneRpcExpr(msg[2]),
                 autoRelease: true,
               });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
@@ -1193,11 +1223,11 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (!entry.hook) {
       if (entry.provenance) {
-        let payload = new Evaluator(this).evaluate(structuredClone(entry.provenance.expr));
+        let payload = new Evaluator(this).evaluate(cloneRpcExpr(entry.provenance.expr));
         let hook: StubHook;
         if (entry.provenance.instructions) {
           const captures = (entry.provenance.captures ?? []).map(captureExpr => {
-            const capturePayload = new Evaluator(this).evaluate(structuredClone(captureExpr));
+            const capturePayload = new Evaluator(this).evaluate(cloneRpcExpr(captureExpr));
             const captureValue = capturePayload.value;
             if (!(captureValue instanceof RpcStub)) {
               capturePayload.dispose();
@@ -1218,7 +1248,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
           if (payload.value instanceof RpcStub) {
             const {hook: provenanceHook, pathIfPromise} = unwrapStubAndPath(payload.value);
-            hook = provenanceHook.map(pathIfPromise ?? [], captures, structuredClone(entry.provenance.instructions));
+            hook = provenanceHook.map(pathIfPromise ?? [], captures, cloneRpcExpr(entry.provenance.instructions));
             payload.dispose();
           } else {
             hook = mapImpl.applyMap(
@@ -1226,7 +1256,7 @@ class RpcSessionImpl implements Importer, Exporter {
                 undefined,
                 payload,
                 captures,
-                structuredClone(entry.provenance.instructions));
+                cloneRpcExpr(entry.provenance.instructions));
           }
         } else {
           hook = new PayloadStubHook(payload);
@@ -1294,19 +1324,14 @@ class RpcSessionImpl implements Importer, Exporter {
     }
 
     if (snapshot.importReplays && snapshot.importReplays.length > 0) {
-      this.importReplays = snapshot.importReplays.map(replay => ({
-        expr: structuredClone(replay.expr),
-        ...(replay.captures ? { captures: structuredClone(replay.captures) } : {}),
-        ...(replay.instructions ? { instructions: structuredClone(replay.instructions) } : {}),
-        ...(replay.path ? { path: structuredClone(replay.path) } : {}),
-      }));
+      this.importReplays = snapshot.importReplays.map(cloneRpcProvenance);
       for (let replay of this.importReplays) {
         this.trace("restoreFromSnapshot.importReplay.begin", {
           hasCaptures: !!replay.captures?.length,
           instructionCount: replay.instructions?.length ?? 0,
           pathLength: replay.path?.length ?? 0,
         });
-        let payload = new Evaluator(this).evaluate(structuredClone(replay.expr));
+        let payload = new Evaluator(this).evaluate(cloneRpcExpr(replay.expr));
         payload.dispose();
       }
     }
