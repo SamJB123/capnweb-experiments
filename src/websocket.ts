@@ -113,11 +113,28 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     }
   }, trace);
 
-  rpc = new RpcSession(transport, localMain, {
-    ...options,
-    __experimental_restoreSnapshot: snapshot,
-    __experimental_trace: (event) => trace(event),
-  });
+  try {
+    rpc = new RpcSession(transport, localMain, {
+      ...options,
+      __experimental_restoreSnapshot: snapshot,
+      __experimental_trace: (event) => trace(event),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('no such entry on exports table')) {
+      // The snapshot references exports from a disconnected peer (e.g. a client
+      // callback that no longer exists). This WebSocket is stale — close it so
+      // the DO can clean up the dead connection.
+      trace({
+        source: "transport",
+        phase: "snapshot.restore.staleSession",
+        detail: { error: msg, sessionId },
+      });
+      try { webSocket.close(1011, 'stale session'); } catch {}
+      throw err;
+    }
+    throw err;
+  }
 
   await persistSnapshot();
 

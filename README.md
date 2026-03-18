@@ -1,5 +1,7 @@
 # Cap'n Web: A JavaScript-native RPC system
 
+> **This is an unofficial, experimental fork** that adds hibernation support. For the official package, see [capnweb on npm](https://www.npmjs.com/package/capnweb).
+
 Cap'n Web is a spiritual sibling to [Cap'n Proto](https://capnproto.org) (and is created by the same author), but designed to play nice in the web stack. That means:
 * Like Cap'n Proto, it is an object-capability protocol. ("Cap'n" is short for "capabilities and".) We'll get into this more below, but it's incredibly powerful.
 * Unlike Cap'n Proto, Cap'n Web has no schemas. In fact, it has almost no boilerplate whatsoever. This means it works more like the [JavaScript-native RPC system in Cloudflare Workers](https://blog.cloudflare.com/javascript-native-rpc/).
@@ -18,10 +20,10 @@ Cap'n Web is more expressive than almost every other RPC system, because it impl
 
 ## Installation
 
-[Cap'n Web is an npm package.](https://www.npmjs.com/package/capnweb)
+[This experimental fork of Cap'n Web is an npm package.](https://www.npmjs.com/package/capnweb-experimental-hibernation)
 
 ```
-npm i capnweb
+npm i capnweb-experimental-hibernation
 ```
 
 ## Example
