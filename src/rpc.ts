@@ -748,6 +748,7 @@ class RpcSessionImpl implements Importer, Exporter {
     for (let i in this.imports) {
       let id = Number(i);
       if (id === 0) continue;
+      if (id > 0) continue;  // Positive imports are transient call results — not needed after hibernation.
 
       let entry = this.imports[i];
       if (!entry) continue;
