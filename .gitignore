@@ -3,4 +3,6 @@ node_modules
 examples/worker-react/web/dist/
 notes.txt
 /dist/
-nul
+/hibernation-tests/.wrangler-old-1776422837
+/hibernation-tests/dist
+/hibernation-tests/dist

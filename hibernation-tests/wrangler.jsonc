@@ -8,13 +8,25 @@
       {
         "name": "HIB_RPC",
         "class_name": "HibRpcDo"
+      },
+      {
+        "name": "CHAT_ROOM",
+        "class_name": "ChatRoomDo"
+      },
+      {
+        "name": "NO_STORE_HIB_RPC",
+        "class_name": "NoStoreHibRpcDo"
       }
     ]
   },
   "migrations": [
     {
-      "tag": "v1",
-      "new_sqlite_classes": ["HibRpcDo"]
+      "tag": "v2",
+      "new_sqlite_classes": ["HibRpcDo", "ChatRoomDo"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["NoStoreHibRpcDo"]
     }
   ]
 }
