@@ -856,9 +856,6 @@ class RpcSessionImpl implements Importer, Exporter {
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
     if (this.abortReason) throw this.abortReason;
 
-    let entry = new ImportTableEntry(this, this.imports.length, false);
-    this.imports.push(entry);
-
     let value: Array<any> = ["pipeline", id, path];
     if (args) {
       let devalue = Devaluator.devaluate(args.value, undefined, this, args);
@@ -870,20 +867,22 @@ class RpcSessionImpl implements Importer, Exporter {
       // Serializing the payload takes ownership of all stubs within, so the payload itself does
       // not need to be disposed.
     }
-    this.send(["push", entry.importId, value]);
-    this.trace("sendCall", { importId: entry.importId, targetImportId: id, pathLength: path.length, hasArgs: !!args });
+    // Allocate the import entry AFTER devaluate succeeds. Computing importId from
+    // `this.imports.length` here (not before devaluate) is required because
+    // Devaluator may itself push into `this.imports` (e.g. via createPipe for a
+    // ReadableStream arg). If devaluate or send throws, no entry is pushed and
+    // there is nothing to clean up.
+    const importId = this.imports.length;
+    this.send(["push", importId, value]);
+    const entry = new ImportTableEntry(this, importId, false);
+    this.imports.push(entry);
+    this.trace("sendCall", { importId, targetImportId: id, pathLength: path.length, hasArgs: !!args });
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
 
   sendStream(id: ImportId, path: PropertyPath, args: RpcPayload)
       : {promise: Promise<void>, size: number} {
     if (this.abortReason) throw this.abortReason;
-
-    let importId = this.imports.length;
-    let entry = new ImportTableEntry(this, importId, /*pulling=*/true);
-    entry.remoteRefcount = 0;
-    entry.localRefcount = 1;
-    this.imports.push(entry);
 
     let value: Array<any> = ["pipeline", id, path];
     let devalue = Devaluator.devaluate(args.value, undefined, this, args);
@@ -892,12 +891,18 @@ class RpcSessionImpl implements Importer, Exporter {
     // TODO: Clean this up somehow.
     value.push((<Array<unknown>>devalue)[0]);
 
+    // Allocate the import entry AFTER devaluate succeeds. See sendCall for rationale.
+    const importId = this.imports.length;
     let size = this.send(["stream", importId, value]);
 
     // Create the import entry in "already pulling" state (pulling=true), since stream messages
     // are automatically pulled. Set remoteRefcount to 0 so that resolve() won't send a release
     // message — the server implicitly releases the export after sending the resolve. Set
     // localRefcount to 1 so that resolve() doesn't treat this as already-disposed.
+    let entry = new ImportTableEntry(this, importId, /*pulling=*/true);
+    entry.remoteRefcount = 0;
+    entry.localRefcount = 1;
+    this.imports.push(entry);
     this.trace("sendStream", { importId, targetImportId: id, pathLength: path.length, size });
 
     // Await the resolution, then dispose the result payload and clean up the import table entry.
@@ -930,10 +935,12 @@ class RpcSessionImpl implements Importer, Exporter {
     });
 
     let value = ["remap", id, path, devaluedCaptures, instructions];
-    let entry = new ImportTableEntry(this, this.imports.length, false);
+    // Allocate the import entry AFTER captures + send succeed. See sendCall for rationale.
+    const importId = this.imports.length;
+    this.send(["push", importId, value]);
+    const entry = new ImportTableEntry(this, importId, false);
     this.imports.push(entry);
-    this.send(["push", entry.importId, value]);
-    this.trace("sendMap", { importId: entry.importId, targetImportId: id, pathLength: path.length, captureCount: captures.length });
+    this.trace("sendMap", { importId, targetImportId: id, pathLength: path.length, captureCount: captures.length });
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
 
@@ -1024,8 +1031,13 @@ class RpcSessionImpl implements Importer, Exporter {
           case "push":  // ["push", ImportId, Expression]
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
+              // Capture the source expression BEFORE evaluation. evaluate() mutates the
+              // expression in place — replacing wire tokens like ["export", N] with live
+              // RpcStub proxies. Cloning afterwards via JSON.stringify would invoke
+              // .toJSON on those proxies, generating spurious RPC pipeline calls.
+              let sourceExpr = cloneRpcExpr(msg[2]);
               if (containsImportedCapabilityReference(msg[2])) {
-                this.importReplays.push({ expr: cloneRpcExpr(msg[2]) });
+                this.importReplays.push({ expr: sourceExpr });
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
                   replayCount: this.importReplays.length,
@@ -1042,7 +1054,7 @@ class RpcSessionImpl implements Importer, Exporter {
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
-                sourceExpr: cloneRpcExpr(msg[2]),
+                sourceExpr,
               });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
@@ -1056,6 +1068,8 @@ class RpcSessionImpl implements Importer, Exporter {
             // - Once the "resolve" is sent, the export is implicitly released.
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
+              // Same as "push": capture sourceExpr BEFORE evaluate mutates msg[2].
+              let sourceExpr = cloneRpcExpr(msg[2]);
               let payload = this.evaluateWithCurrentProvenance(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
@@ -1063,7 +1077,7 @@ class RpcSessionImpl implements Importer, Exporter {
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
-                sourceExpr: cloneRpcExpr(msg[2]),
+                sourceExpr,
                 autoRelease: true,
               });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
