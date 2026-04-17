@@ -62,13 +62,25 @@ export type HibernatableWebSocketAttachment = {
 export interface HibernatableSessionStore {
   load(sessionId: string): Promise<RpcSessionSnapshot | undefined>;
   save(sessionId: string, snapshot: RpcSessionSnapshot): Promise<void>;
-  delete?(sessionId: string): Promise<void>;
+  delete(sessionId: string): Promise<void>;
+
+  /**
+   * Delete stored sessions whose IDs are NOT in the provided set.
+   * Call on Durable Object wake-up to clean up sessions for clients that
+   * disconnected during hibernation (whose `handleClose` never fired).
+   *
+   * @param liveSessionIds - Session IDs that still have connected WebSockets
+   * @returns Number of orphaned sessions deleted
+   */
+  deleteOrphans?(liveSessionIds: Set<string>): Promise<number>;
 }
 
 export interface DurableObjectStorageLike {
   get(key: string): Promise<unknown>;
   put(key: string, value: unknown): Promise<void>;
-  delete?(key: string): Promise<unknown>;
+  delete(key: string): Promise<unknown>;
+  delete(keys: string[]): Promise<number>;
+  list?(options: { prefix: string }): Promise<Map<string, unknown>>;
 }
 
 export function __experimental_newDurableObjectSessionStore(
@@ -85,7 +97,26 @@ export function __experimental_newDurableObjectSessionStore(
     },
 
     async delete(sessionId: string) {
-      await storage.delete?.(`${prefix}${sessionId}`);
+      await storage.delete(`${prefix}${sessionId}`);
+    },
+
+    async deleteOrphans(liveSessionIds: Set<string>): Promise<number> {
+      if (!storage.list) return 0;
+
+      const stored = await storage.list({ prefix });
+      const orphanKeys: string[] = [];
+      for (const key of stored.keys()) {
+        const sessionId = key.slice(prefix.length);
+        if (!liveSessionIds.has(sessionId)) {
+          orphanKeys.push(key);
+        }
+      }
+
+      if (orphanKeys.length > 0) {
+        await storage.delete(orphanKeys);
+      }
+
+      return orphanKeys.length;
     },
   };
 }

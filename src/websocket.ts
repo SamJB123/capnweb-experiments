@@ -46,8 +46,10 @@ export function newWorkersWebSocketRpcResponse(
 }
 
 export type HibernatableWebSocketOptions = RpcSessionOptions & {
-  /** Optional session store for persisting snapshots to durable storage as a
-   *  backup. The primary persistence mechanism is the WebSocket attachment. */
+  /** Optional session store for persisting snapshots to durable storage.
+   *  When provided, the full snapshot is stored here instead of in the
+   *  WebSocket attachment (which has a 2048-byte limit in workerd). The
+   *  attachment will only contain the session ID for restore lookup. */
   sessionStore?: HibernatableSessionStore;
   sessionId?: string;
   __experimental_trace?: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => void;
@@ -86,7 +88,7 @@ export type HibernatableTransportTraceEvent = {
 export async function __experimental_newHibernatableWebSocketRpcSession(
     webSocket: HibernatableWebSocket,
     localMain: any,
-    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession> {
+    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession | undefined> {
 
   let attachment = getAttachment(webSocket);
   const sessionId = options.sessionId ?? attachment?.sessionId ?? makeSessionId();
@@ -131,7 +133,10 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
         detail: { error: msg, sessionId },
       });
       try { webSocket.close(1011, 'stale session'); } catch {}
-      throw err;
+      if (options.sessionStore) {
+        await options.sessionStore.delete(sessionId);
+      }
+      return undefined;
     }
     throw err;
   }
@@ -157,6 +162,11 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     },
     handleClose(code?: number, reason?: string, wasClean?: boolean) {
       transport.notifyClosed(code, reason, wasClean);
+      if (options.sessionStore) {
+        options.sessionStore.delete(sessionId).catch((err) => {
+          console.error(`[capnweb] Failed to delete session ${sessionId} from store:`, err);
+        });
+      }
     },
     handleError(error: any) {
       transport.notifyError(error);
@@ -166,29 +176,68 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
   async function persistSnapshot() {
     try {
       let snap = rpc.__experimental_snapshot();
-      webSocket.serializeAttachment?.({
-        sessionId,
-        version: 1 satisfies 1,
-        snapshot: snap,
-      } satisfies HibernatableWebSocketAttachment);
       if (options.sessionStore) {
+        // When a session store is available, persist the full snapshot there
+        // (no size limit) and only store the session ID in the attachment
+        // (which has a 2048-byte limit in workerd).
         await options.sessionStore.save(sessionId, snap);
       }
+
+      // Namespace capnweb data under __capnweb in the attachment so we don't
+      // clobber other libraries (e.g. partyserver) that also use the attachment
+      // for their own per-connection metadata.
+      let capnwebData: HibernatableWebSocketAttachment = options.sessionStore
+        ? { sessionId, version: 1 satisfies 1 }
+        : { sessionId, version: 1 satisfies 1, snapshot: snap };
+      let existing = webSocket.deserializeAttachment?.() ?? {};
+      if (typeof existing !== "object" || existing === null) existing = {};
+      webSocket.serializeAttachment?.({ ...existing, __capnweb: capnwebData });
     } catch (err) {
       transport.abort?.(err);
     }
   }
 }
 
+/**
+ * Clean up session store entries for clients that disconnected during
+ * hibernation. Call this once on Durable Object wake-up.
+ *
+ * Reads the capnweb sessionId from each live WebSocket's attachment,
+ * then delegates to `sessionStore.deleteOrphans()` to remove any stored
+ * sessions that no longer have a connected WebSocket.
+ *
+ * @param webSockets - All currently connected WebSockets (from `ctx.getWebSockets()`)
+ * @param sessionStore - The session store used when creating sessions
+ * @returns Number of orphaned sessions deleted, or 0 if the store doesn't support deleteOrphans
+ */
+export async function __experimental_cleanupOrphanedSessions(
+    webSockets: WebSocket[],
+    sessionStore: HibernatableSessionStore): Promise<number> {
+  if (!sessionStore.deleteOrphans) return 0;
+
+  const liveIds = new Set<string>();
+  for (const ws of webSockets) {
+    const attachment = getAttachment(ws as HibernatableWebSocket);
+    if (attachment?.sessionId) {
+      liveIds.add(attachment.sessionId);
+    }
+  }
+
+  return sessionStore.deleteOrphans(liveIds);
+}
+
 export async function __experimental_resumeHibernatableWebSocketRpcSession(
     webSocket: HibernatableWebSocket,
     localMain: any,
-    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession> {
+    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession | undefined> {
   return __experimental_newHibernatableWebSocketRpcSession(webSocket, localMain, options);
 }
 
 function getAttachment(webSocket: HibernatableWebSocket): HibernatableWebSocketAttachment | undefined {
-  let attachment = webSocket.deserializeAttachment?.() as HibernatableWebSocketAttachment | null | undefined;
+  let raw = webSocket.deserializeAttachment?.() as Record<string, unknown> | null | undefined;
+  // Look for capnweb data under __capnweb namespace first (coexistence with
+  // other libraries), falling back to the raw attachment for backwards compat.
+  let attachment = (raw?.__capnweb ?? raw) as HibernatableWebSocketAttachment | null | undefined;
   if (attachment?.version === 1 && typeof attachment.sessionId === "string") {
     return attachment;
   }
@@ -281,7 +330,7 @@ class WebSocketTransport implements RpcTransport {
     if (reason instanceof Error) {
       message = reason.message;
     } else {
-      message = `${reason}`;
+      try { message = JSON.stringify(reason); } catch { message = `${reason}`; }
     }
     this.#webSocket.close(3000, message);
 
@@ -377,7 +426,7 @@ class HibernatableWebSocketTransport implements RpcTransport {
     if (reason instanceof Error) {
       message = reason.message;
     } else {
-      message = `${reason}`;
+      try { message = JSON.stringify(reason); } catch { message = `${reason}`; }
     }
 
     try {

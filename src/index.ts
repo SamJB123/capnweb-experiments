@@ -10,13 +10,15 @@ import {
 } from "./core.js";
 import { serialize, deserialize } from "./serialize.js";
 import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
+import type { RpcSessionDebugState } from "./rpc.js";
+import type { HibernatableSessionStore, RpcSessionSnapshot } from "./hibernation.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
 import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
          newWorkersWebSocketRpcResponse,
          __experimental_newHibernatableWebSocketRpcSession as __experimental_newHibernatableWebSocketRpcSessionImpl,
          __experimental_resumeHibernatableWebSocketRpcSession as __experimental_resumeHibernatableWebSocketRpcSessionImpl,
-         type HibernatableWebSocketOptions,
-         type HibernatableWebSocketSession } from "./websocket.js";
+         __experimental_cleanupOrphanedSessions as __experimental_cleanupOrphanedSessionsImpl,
+         type HibernatableWebSocketOptions } from "./websocket.js";
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
@@ -38,7 +40,7 @@ export type {
   RpcSessionSnapshotImport,
   RpcSessionSnapshotExport,
 } from "./hibernation.js";
-export type { HibernatableWebSocketOptions, HibernatableWebSocketSession };
+export type { HibernatableWebSocketOptions };
 
 // Hack the type system to make RpcStub's types work nicely!
 /**
@@ -119,6 +121,22 @@ export const RpcTarget: {
 interface Empty {}
 
 /**
+ * RPC session restored on top of a hibernating WebSocket. `T` is the interface
+ * the peer exposes — `getRemoteMain()` returns a typed stub for it. Mirrors
+ * the typing relationship between `RpcSession<T>` and `getRemoteMain(): RpcStub<T>`.
+ */
+export interface HibernatableWebSocketSession<T extends RpcCompatible<T> = Empty> {
+  sessionId: string;
+  getRemoteMain(): RpcStub<T>;
+  getStats(): {imports: number, exports: number};
+  __experimental_snapshot(): RpcSessionSnapshot;
+  __experimental_debugState(): RpcSessionDebugState;
+  handleMessage(message: string | ArrayBuffer): void;
+  handleClose(code?: number, reason?: string, wasClean?: boolean): void;
+  handleError(error: any): void;
+}
+
+/**
  * Start a WebSocket session given either an already-open WebSocket or a URL.
  *
  * @param webSocket Either the `wss://` URL to connect to, or an already-open WebSocket object to
@@ -151,12 +169,16 @@ export let newMessagePortRpcSession:<T extends RpcCompatible<T> = Empty>
     <any>newMessagePortRpcSessionImpl;
 
 export let __experimental_newHibernatableWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
-    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession> =
+    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession<T> | undefined> =
     <any>__experimental_newHibernatableWebSocketRpcSessionImpl;
 
 export let __experimental_resumeHibernatableWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
-    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession> =
+    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession<T> | undefined> =
     <any>__experimental_resumeHibernatableWebSocketRpcSessionImpl;
+
+export let __experimental_cleanupOrphanedSessions:
+    (webSockets: WebSocket[], sessionStore: HibernatableSessionStore) => Promise<number> =
+    __experimental_cleanupOrphanedSessionsImpl;
 
 export const __experimental_debugRpcReference:
     (value: unknown) => Record<string, unknown> =

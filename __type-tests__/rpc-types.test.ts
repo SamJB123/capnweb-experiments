@@ -5,6 +5,9 @@ import {
   RpcTarget,
   newHttpBatchRpcSession,
   newWebSocketRpcSession,
+  __experimental_newHibernatableWebSocketRpcSession,
+  __experimental_resumeHibernatableWebSocketRpcSession,
+  type HibernatableWebSocketSession,
   type RpcCompatible,
   type RpcTransport,
 } from "../src/index.js"
@@ -106,6 +109,22 @@ const wsApi = newWebSocketRpcSession<PublicApi>("wss://example.com/rpc")
 const batchApi = newHttpBatchRpcSession<PublicApi>("https://example.com/rpc")
 expectType<RpcStub<PublicApi>>(wsApi)
 expectType<RpcStub<PublicApi>>(batchApi)
+
+// Hibernatable session should thread T through to getRemoteMain.
+declare const hibernatableWs: WebSocket
+declare const hibernatableOpts: Parameters<typeof __experimental_newHibernatableWebSocketRpcSession>[2]
+const hibernatableSessionPromise = __experimental_newHibernatableWebSocketRpcSession<PublicApi>(
+  hibernatableWs, undefined, hibernatableOpts,
+)
+expectType<Promise<HibernatableWebSocketSession<PublicApi> | undefined>>(hibernatableSessionPromise)
+
+const resumePromise = __experimental_resumeHibernatableWebSocketRpcSession<PublicApi>(
+  hibernatableWs, undefined, hibernatableOpts,
+)
+expectType<Promise<HibernatableWebSocketSession<PublicApi> | undefined>>(resumePromise)
+
+declare const hibernatableSession: HibernatableWebSocketSession<PublicApi>
+expectType<RpcStub<PublicApi>>(hibernatableSession.getRemoteMain())
 
 // Positive coverage for direct calls, pipelining, and accepted promise-like arguments.
 const ping = api.ping()
