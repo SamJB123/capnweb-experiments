@@ -12,6 +12,7 @@ import type { HibernatableTransportTraceEvent } from "../../src/websocket.ts";
 interface Env {
   HIB_RPC: DurableObjectNamespace<HibRpcDo>;
   CHAT_ROOM: DurableObjectNamespace<ChatRoomDo>;
+  NO_STORE_HIB_RPC: DurableObjectNamespace<NoStoreHibRpcDo>;
 }
 
 type ChatMessage = {
@@ -254,7 +255,10 @@ export class ChatRoomDo extends DurableObject {
   }
 
   private getRoomSessionId(ws: WebSocket): string | undefined {
-    const attachment = (ws as any).deserializeAttachment?.();
+    const raw = (ws as any).deserializeAttachment?.();
+    // capnweb namespaces its data under __capnweb (see persistSnapshot in
+    // src/websocket.ts). Fall back to raw for backwards compatibility.
+    const attachment = raw?.__capnweb ?? raw;
     if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
       return attachment.sessionId;
     }
@@ -372,19 +376,25 @@ export class HibRpcDo extends DurableObject {
 
     if (url.pathname === "/attachments") {
       const sockets = this.ctx.getWebSockets("capnweb");
-      const attachments = sockets.map((ws) => {
-        const attachment = (ws as any).deserializeAttachment?.();
+      // capnweb stores snapshots in the sessionStore (when provided) instead of
+      // inline on the attachment, so consult both sources for hasSnapshot/snapshot.
+      const attachments = await Promise.all(sockets.map(async (ws) => {
+        const raw = (ws as any).deserializeAttachment?.();
+        const attachment = raw?.__capnweb ?? raw;
+        const sessionId = attachment?.sessionId ?? null;
+        const stored = sessionId ? await this.sessionStore.load(sessionId) : undefined;
+        const snap: any = attachment?.snapshot ?? stored ?? null;
         return {
-          sessionId: attachment?.sessionId ?? null,
+          sessionId,
           version: attachment?.version ?? null,
-          hasSnapshot: !!attachment?.snapshot,
-          snapshot: attachment?.snapshot ? {
-            nextExportId: attachment.snapshot.nextExportId ?? null,
-            exportCount: attachment.snapshot.exports?.length ?? 0,
-            importCount: attachment.snapshot.imports?.length ?? 0,
+          hasSnapshot: !!snap,
+          snapshot: snap ? {
+            nextExportId: snap.nextExportId ?? null,
+            exportCount: snap.exports?.length ?? 0,
+            importCount: snap.imports?.length ?? 0,
           } : null,
         };
-      });
+      }));
       return Response.json({
         instanceId: this.instanceId,
         count: attachments.length,
@@ -394,8 +404,9 @@ export class HibRpcDo extends DurableObject {
 
     if (url.pathname === "/resume-diagnostics") {
       const sockets = this.ctx.getWebSockets("capnweb");
-      const diagnostics = sockets.map((ws) => {
-        const attachment = (ws as any).deserializeAttachment?.();
+      const diagnostics = await Promise.all(sockets.map(async (ws) => {
+        const raw = (ws as any).deserializeAttachment?.();
+        const attachment = raw?.__capnweb ?? raw;
         const sessionId = attachment?.sessionId;
         const session = sessionId ? this.sessions.get(sessionId) : undefined;
         let snapshot: any = null;
@@ -410,16 +421,21 @@ export class HibRpcDo extends DurableObject {
         } catch (err: any) {
           debugState = { error: err?.message ?? `${err}` };
         }
+        // The fork stores snapshots in the sessionStore (instead of inline on
+        // the attachment) when one is provided. Surface the persisted snapshot
+        // here so the tests can verify persistence end-to-end.
+        const storedSnap = sessionId ? await this.sessionStore.load(sessionId) : undefined;
+        const persistedSnap: any = attachment?.snapshot ?? storedSnap ?? null;
         return {
           sessionId: sessionId ?? null,
           hasAttachment: !!attachment,
-          hasSnapshot: !!attachment?.snapshot,
+          hasSnapshot: !!persistedSnap,
           hasSession: !!session,
           stats: session?.getStats?.() ?? null,
-          attachmentSnapshot: attachment?.snapshot ? {
-            nextExportId: attachment.snapshot.nextExportId ?? null,
-            exportCount: attachment.snapshot.exports?.length ?? 0,
-            importCount: attachment.snapshot.imports?.length ?? 0,
+          attachmentSnapshot: persistedSnap ? {
+            nextExportId: persistedSnap.nextExportId ?? null,
+            exportCount: persistedSnap.exports?.length ?? 0,
+            importCount: persistedSnap.imports?.length ?? 0,
           } : null,
           snapshot: snapshot ? {
             nextExportId: snapshot.nextExportId ?? null,
@@ -430,7 +446,7 @@ export class HibRpcDo extends DurableObject {
           debugState,
           traces: sessionId ? (this.sessionTraces.get(sessionId) ?? []) : [],
         };
-      });
+      }));
       return Response.json({
         instanceId: this.instanceId,
         sessionCount: this.sessions.size,
@@ -601,7 +617,10 @@ export class HibRpcDo extends DurableObject {
   }
 
   private getSessionId(ws: WebSocket): string | undefined {
-    const attachment = (ws as any).deserializeAttachment?.();
+    const raw = (ws as any).deserializeAttachment?.();
+    // capnweb namespaces its data under __capnweb (see persistSnapshot in
+    // src/websocket.ts). Fall back to raw for backwards compatibility.
+    const attachment = raw?.__capnweb ?? raw;
     if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
       return attachment.sessionId;
     }
@@ -629,6 +648,129 @@ export class HibRpcDo extends DurableObject {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// NoStoreHibRpcDo: same shape as HibRpcDo but does NOT pass a sessionStore to
+// __experimental_newHibernatableWebSocketRpcSession. In that mode the library
+// inlines the snapshot into the WebSocket attachment instead of persisting it
+// to a separate store. This DO + its endpoints exist so we can verify the
+// attachment-only persistence path end-to-end.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class NoStoreRootTarget extends RpcTarget {
+  constructor(private ctx: DurableObjectState, private host: NoStoreHibRpcDo) { super(); }
+  echo(msg: string) { return msg; }
+  square(n: number) { return n * n; }
+  getInstanceId() { return this.host.instanceId; }
+  getDurableCounter(key: string) { return new DurableCounterProxy(this.ctx, key); }
+}
+
+export class NoStoreHibRpcDo extends DurableObject {
+  sessions = new Map<string, any>();
+  instanceId: string;
+  ready: Promise<void>;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.instanceId = crypto.randomUUID();
+    this.ready = this.restoreSessions();
+  }
+
+  private async restoreSessions() {
+    for (const ws of this.ctx.getWebSockets("capnweb-no-store")) {
+      await this.attachSession(ws);
+    }
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/instance-id") {
+      return Response.json({ instanceId: this.instanceId });
+    }
+
+    if (url.pathname === "/attachments") {
+      const sockets = this.ctx.getWebSockets("capnweb-no-store");
+      const attachments = sockets.map((ws) => {
+        const raw = (ws as any).deserializeAttachment?.();
+        const attachment = raw?.__capnweb ?? raw;
+        return {
+          sessionId: attachment?.sessionId ?? null,
+          version: attachment?.version ?? null,
+          // No sessionStore is provided to the session, so the snapshot must
+          // live inline on the attachment.
+          hasSnapshot: !!attachment?.snapshot,
+          snapshot: attachment?.snapshot ? {
+            nextExportId: attachment.snapshot.nextExportId ?? null,
+            exportCount: attachment.snapshot.exports?.length ?? 0,
+            importCount: attachment.snapshot.imports?.length ?? 0,
+          } : null,
+        };
+      });
+      return Response.json({ instanceId: this.instanceId, count: attachments.length, attachments });
+    }
+
+    if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server, ["capnweb-no-store"]);
+    await this.ready;
+    await this.attachSession(server);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    await this.ready;
+    const session = await this.getOrAttachSession(ws);
+    session.handleMessage(message);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    await this.ready;
+    const sid = this.getSessionId(ws);
+    const session = sid ? this.sessions.get(sid) : undefined;
+    session?.handleClose(code, reason, wasClean);
+    if (sid) this.sessions.delete(sid);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown) {
+    await this.ready;
+    const sid = this.getSessionId(ws);
+    const session = sid ? this.sessions.get(sid) : undefined;
+    session?.handleError(error);
+  }
+
+  private async getOrAttachSession(ws: WebSocket) {
+    const sid = this.getSessionId(ws);
+    if (sid && this.sessions.has(sid)) return this.sessions.get(sid);
+    return this.attachSession(ws);
+  }
+
+  private async attachSession(ws: WebSocket) {
+    const knownSessionId = this.getSessionId(ws);
+    // Note: NO sessionStore here — snapshot will live inline on the attachment.
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+        ws as any,
+        new NoStoreRootTarget(this.ctx, this),
+        {
+          onSendError(err) { return err; },
+          sessionId: knownSessionId,
+        });
+    this.sessions.set(session.sessionId, session);
+    return session;
+  }
+
+  private getSessionId(ws: WebSocket): string | undefined {
+    const raw = (ws as any).deserializeAttachment?.();
+    const attachment = raw?.__capnweb ?? raw;
+    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
+      return attachment.sessionId;
+    }
+    return undefined;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
@@ -639,6 +781,17 @@ export default {
         url.pathname === "/resume-diagnostics") {
       const stub = env.HIB_RPC.getByName("test");
       return stub.fetch(request);
+    }
+
+    if (
+        url.pathname === "/no-store-ws" ||
+        url.pathname === "/no-store-instance-id" ||
+        url.pathname === "/no-store-attachments") {
+      const stub = env.NO_STORE_HIB_RPC.getByName("no-store-test");
+      const innerUrl = new URL(request.url);
+      innerUrl.pathname = url.pathname.replace(/^\/no-store-/, "/");
+      if (innerUrl.pathname === "/ws") innerUrl.pathname = "/ws";
+      return stub.fetch(new Request(innerUrl.toString(), request));
     }
 
     if (
