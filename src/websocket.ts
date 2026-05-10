@@ -66,11 +66,6 @@ export interface HibernatableWebSocketSession {
   handleError(error: any): void;
 }
 
-type HibernatableWebSocket = WebSocket & {
-  serializeAttachment?(value: unknown): void;
-  deserializeAttachment?(): unknown;
-};
-
 export type HibernatableTransportTraceEvent = {
   source: "transport";
   phase: string;
@@ -86,7 +81,7 @@ export type HibernatableTransportTraceEvent = {
  * `webSocketMessage()` / `webSocketClose()` / `webSocketError()` event delivery model.
  */
 export async function __experimental_newHibernatableWebSocketRpcSession(
-    webSocket: HibernatableWebSocket,
+    webSocket: WebSocket,
     localMain: any,
     options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession | undefined> {
 
@@ -189,9 +184,9 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
       let capnwebData: HibernatableWebSocketAttachment = options.sessionStore
         ? { sessionId, version: 1 satisfies 1 }
         : { sessionId, version: 1 satisfies 1, snapshot: snap };
-      let existing = webSocket.deserializeAttachment?.() ?? {};
+      let existing = webSocket.deserializeAttachment() ?? {};
       if (typeof existing !== "object" || existing === null) existing = {};
-      webSocket.serializeAttachment?.({ ...existing, __capnweb: capnwebData });
+      webSocket.serializeAttachment({ ...existing, __capnweb: capnwebData });
     } catch (err) {
       transport.abort?.(err);
     }
@@ -217,7 +212,7 @@ export async function __experimental_cleanupOrphanedSessions(
 
   const liveIds = new Set<string>();
   for (const ws of webSockets) {
-    const attachment = getAttachment(ws as HibernatableWebSocket);
+    const attachment = getAttachment(ws);
     if (attachment?.sessionId) {
       liveIds.add(attachment.sessionId);
     }
@@ -227,14 +222,49 @@ export async function __experimental_cleanupOrphanedSessions(
 }
 
 export async function __experimental_resumeHibernatableWebSocketRpcSession(
-    webSocket: HibernatableWebSocket,
+    webSocket: WebSocket,
     localMain: any,
     options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession | undefined> {
   return __experimental_newHibernatableWebSocketRpcSession(webSocket, localMain, options);
 }
 
-function getAttachment(webSocket: HibernatableWebSocket): HibernatableWebSocketAttachment | undefined {
-  let raw = webSocket.deserializeAttachment?.() as Record<string, unknown> | null | undefined;
+/**
+ * Returns the capnweb session ID associated with this WebSocket, if any.
+ *
+ * A session ID is stamped onto the WebSocket's attachment by
+ * `__experimental_newHibernatableWebSocketRpcSession` the first time a
+ * session is opened over it. The attachment survives hibernation, so this
+ * is the right way — from inside `webSocketMessage`, `webSocketClose`, etc.
+ * — to tell whether you've already seen a given WebSocket and can reuse a
+ * cached session instance.
+ *
+ * The session ID is always on the attachment regardless of whether a
+ * `sessionStore` was provided: in store mode the snapshot lives in the
+ * store while the attachment keeps just the ID; in inline mode the
+ * snapshot lives alongside the ID on the attachment itself. Either way,
+ * this function reads the same field.
+ *
+ * Returns `undefined` if the WebSocket has no capnweb attachment (e.g. a
+ * fresh connection that hasn't been handed to
+ * `__experimental_newHibernatableWebSocketRpcSession` yet).
+ *
+ * Typical usage in a Durable Object:
+ *
+ *     private sessions = new Map<string, MySessionEntry>();
+ *
+ *     async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+ *       const sid = __experimental_hibernatableWebSocketSessionId(ws);
+ *       const entry = (sid && this.sessions.get(sid)) ?? await this.attach(ws);
+ *       entry.session.handleMessage(message);
+ *     }
+ */
+export function __experimental_hibernatableWebSocketSessionId(
+    webSocket: WebSocket): string | undefined {
+  return getAttachment(webSocket)?.sessionId;
+}
+
+function getAttachment(webSocket: WebSocket): HibernatableWebSocketAttachment | undefined {
+  let raw = webSocket.deserializeAttachment() as Record<string, unknown> | null | undefined;
   // Look for capnweb data under __capnweb namespace first (coexistence with
   // other libraries), falling back to the raw attachment for backwards compat.
   let attachment = (raw?.__capnweb ?? raw) as HibernatableWebSocketAttachment | null | undefined;

@@ -18,6 +18,7 @@ import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
          __experimental_newHibernatableWebSocketRpcSession as __experimental_newHibernatableWebSocketRpcSessionImpl,
          __experimental_resumeHibernatableWebSocketRpcSession as __experimental_resumeHibernatableWebSocketRpcSessionImpl,
          __experimental_cleanupOrphanedSessions as __experimental_cleanupOrphanedSessionsImpl,
+         __experimental_hibernatableWebSocketSessionId as __experimental_hibernatableWebSocketSessionIdImpl,
          type HibernatableWebSocketOptions } from "./websocket.js";
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
@@ -179,6 +180,10 @@ export let __experimental_resumeHibernatableWebSocketRpcSession:<T extends RpcCo
 export let __experimental_cleanupOrphanedSessions:
     (webSockets: WebSocket[], sessionStore: HibernatableSessionStore) => Promise<number> =
     __experimental_cleanupOrphanedSessionsImpl;
+
+export let __experimental_hibernatableWebSocketSessionId:
+    (webSocket: WebSocket) => string | undefined =
+    __experimental_hibernatableWebSocketSessionIdImpl;
 
 export const __experimental_debugRpcReference:
     (value: unknown) => Record<string, unknown> =
