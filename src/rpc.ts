@@ -436,7 +436,7 @@ class RpcSessionImpl implements Importer, Exporter {
   private imports: Array<ImportTableEntry> = [];
   private importReplays: RpcSessionExportProvenance[] = [];
   private abortReason?: any;
-  private cancelReadLoop: (error: any) => void;
+  private cancelReadLoop?: (error: any) => void;
 
   // We assign positive numbers to imports we initiate, and negative numbers to exports we
   // initiate. So the next import ID is just `imports.length`, but the next export ID needs
@@ -466,11 +466,7 @@ class RpcSessionImpl implements Importer, Exporter {
       this.restoreFromSnapshot(snapshot);
     }
 
-    let rejectFunc: (error: any) => void;;
-    let abortPromise = new Promise<never>((resolve, reject) => { rejectFunc = reject; });
-    this.cancelReadLoop = rejectFunc!;
-
-    this.readLoop(abortPromise).catch(err => this.abort(err));
+    this.readLoop().catch(err => this.abort(err));
   }
 
   private trace(phase: string, detail?: Record<string, unknown>) {
@@ -963,7 +959,8 @@ class RpcSessionImpl implements Importer, Exporter {
     // Don't double-abort.
     if (this.abortReason !== undefined) return;
 
-    this.cancelReadLoop(error);
+    this.cancelReadLoop?.(error);
+    this.cancelReadLoop = undefined;
 
     if (trySendAbortMessage) {
       try {
@@ -1017,9 +1014,22 @@ class RpcSessionImpl implements Importer, Exporter {
     }
   }
 
-  private async readLoop(abortPromise: Promise<never>) {
+  private async readLoop() {
     while (!this.abortReason) {
-      let msg = JSON.parse(await Promise.race([this.transport.receive(), abortPromise]));
+      // Each receive needs its own abort promise so Promise.race() doesn't keep old reads.
+      let readCanceled = Promise.withResolvers<never>();
+      this.cancelReadLoop = readCanceled.reject;
+
+      let msgText: string;
+      try {
+        msgText = await Promise.race([this.transport.receive(), readCanceled.promise]);
+      } finally {
+        if (this.cancelReadLoop === readCanceled.reject) {
+          this.cancelReadLoop = undefined;
+        }
+      }
+
+      let msg = JSON.parse(msgText);
       if (this.abortReason) break;  // check again before processing
       this.trace("receive", {
         kind: msg instanceof Array ? msg[0] : typeof msg,

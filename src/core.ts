@@ -42,8 +42,8 @@ export let RpcTarget = workersModule ? workersModule.RpcTarget : class {};
 export type PropertyPath = (string | number)[];
 
 type TypeForRpc = "unsupported" | "primitive" | "object" | "function" | "array" | "date" |
-    "bigint" | "bytes" | "stub" | "rpc-promise" | "rpc-target" | "rpc-thenable" | "error" |
-    "undefined";
+    "bigint" | "bytes" | "blob" | "stub" | "rpc-promise" | "rpc-target" | "rpc-thenable" |
+    "error" | "undefined" | "writable" | "readable" | "headers" | "request" | "response";
 
 const AsyncFunction = (async function () {}).constructor;
 
@@ -94,6 +94,24 @@ export function typeForRpc(value: unknown): TypeForRpc {
 
     case Uint8Array.prototype:
       return "bytes";
+
+    case WritableStream.prototype:
+      return "writable";
+
+    case ReadableStream.prototype:
+      return "readable";
+
+    case Headers.prototype:
+      return "headers";
+
+    case Request.prototype:
+      return "request";
+
+    case Response.prototype:
+      return "response";
+
+    case Blob.prototype:
+      return "blob";
 
     // TODO: All other structured clone types.
 
@@ -817,6 +835,7 @@ export class RpcPayload {
       case "bigint":
       case "date":
       case "bytes":
+      case "blob":
       case "error":
       case "undefined":
         // immutable, no need to copy
@@ -1084,6 +1103,7 @@ export class RpcPayload {
       case "primitive":
       case "bigint":
       case "bytes":
+      case "blob":
       case "date":
       case "error":
       case "undefined":
@@ -1170,6 +1190,7 @@ export class RpcPayload {
       case "primitive":
       case "bigint":
       case "bytes":
+      case "blob":
       case "date":
       case "error":
       case "undefined":
@@ -1306,6 +1327,7 @@ function followPath(value: unknown, parent: object | undefined,
       case "primitive":
       case "bigint":
       case "bytes":
+      case "blob":
       case "date":
       case "error":
         // These have no properties that can be accessed remotely.
