@@ -25,7 +25,7 @@ export class MapBuilder implements Exporter {
     | {parent: MapBuilder, captures: number[], subject: number, path: PropertyPath};
   private captureMap: Map<StubHook, number> = new Map();
 
-  private instructions: MapInstruction[] = [];
+  instructions: MapInstruction[] = [];
 
   constructor(subject: StubHook, path: PropertyPath) {
     if (currentMapBuilder) {
@@ -239,7 +239,7 @@ export class MapVariableHook extends StubHook {
 
 export function __experimental_recordInputPath(path: PropertyPath): RecordedMapProgram {
   let builder = new MapBuilder(new ErrorStubHook(new Error("map-recorder-subject")), []);
-  let result: RpcPayload;
+  let result: RpcPayload | undefined;
   try {
     let hook = builder.makeInput().get(path);
     result = RpcPayload.fromAppReturn(new RpcPromise(hook, []));
