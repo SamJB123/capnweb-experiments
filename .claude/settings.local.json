@@ -2,16 +2,7 @@
   "permissions": {
     "allow": [
       "WebSearch",
-<<<<<<< Updated upstream
       "WebFetch(domain:developers.cloudflare.com)"
-=======
-      "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\reference-material\\\\tanstack-db\")",
-      "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\reference-material\\\\tanstack-db\\\\packages\")",
-      "Bash(dir:*)",
-      "Bash(findstr \"^UU\")",
-      "Bash(git log *)",
-      "Bash(findstr /V \"^UU\")"
->>>>>>> Stashed changes
     ]
   }
 }
