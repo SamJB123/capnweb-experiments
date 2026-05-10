@@ -46,6 +46,17 @@ class NullExporter implements Exporter {
 
 const NULL_EXPORTER = new NullExporter();
 
+// Collect all bytes from a ReadableStream into a Blob with the given MIME type. Used on the
+// receive side to assemble a Blob from a pipe stream before delivering to user code.
+//
+// `Response` is a standard global in every runtime we support (Node >=18, browsers, workerd), so
+// we can rely on `Response.blob()` for the heavy lifting. `Response.blob()` may discard the
+// caller-specified MIME type, so we `slice()` to reattach it if needed.
+async function streamToBlob(stream: ReadableStream, type: string): Promise<Blob> {
+  let b = await new Response(stream).blob();
+  return b.type === type ? b : b.slice(0, b.size, type);
+}
+
 // Maps error name to error class for deserialization.
 const ERROR_TYPES: Record<string, any> = {
   Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError,
@@ -81,6 +92,9 @@ export class Devaluator {
           // probably a side effect of the original error, ignore it
         }
       }
+      // TODO: This rollback only releases exports. Pipes created via `createPipe` (for
+      // ReadableStreams, Blobs, and the Firefox request-body fallback) have already sent a
+      // ["pipe"] frame and started pumping.
       throw err;
     }
   }
@@ -143,8 +157,10 @@ export class Devaluator {
       case "bigint":
         return ["bigint", (<bigint>value).toString()];
 
-      case "date":
-        return ["date", (<Date>value).getTime()];
+      case "date": {
+        const time = (<Date>value).getTime();
+        return ["date", Number.isNaN(time) ? null : time];
+      }
 
       case "bytes": {
         let bytes = value as Uint8Array;
@@ -293,21 +309,87 @@ export class Devaluator {
         return ["response", body, init];
       }
 
+      case "blob": {
+        // Blobs are streamed through a pipe. This allows very large blobs to be sent without
+        // causing excessively large individual messages nor blocking other messages in the
+        // meantime.
+        //
+        // Ideally, small Blobs would be inlined. But, there is no way to read a blob
+        // synchronously, and we MUST serialize the message synchronously. Hence, we have no choice
+        // but to use streaming even for small blobs.
+        let blob = value as Blob;
+        let readable = blob.stream();
+        let hook = streamImpl.createReadableStreamHook(readable);
+        let importId = this.exporter.createPipe(readable, hook);
+        return ["blob", blob.type, ["readable", importId]];
+      }
+
       case "error": {
         let e = <Error>value;
 
         // TODO:
         // - Determine type by checking prototype rather than `name`, which can be overridden?
-        // - Serialize cause / suppressed error / etc.
-        // - Serialize added properties.
 
         let rewritten = this.exporter.onSendError(e);
         if (rewritten) {
           e = rewritten;
         }
 
-        let result = ["error", e.name, e.message];
-        if (rewritten && rewritten.stack) {
+        // Capture own enumerable properties plus the standard non-enumerable slots `cause`
+        // and (for AggregateError) `errors`. Each value is run through devaluateImpl so any
+        // supported type round-trips. If a property's value can't be serialized, drop the
+        // property: the error itself must always make it through. Use `onSendError` to scrub
+        // heavy or sensitive fields explicitly.
+        //
+        // On per-property failure we roll back any exports the partial walk produced by
+        // splicing them off `this.exports` and unexporting them.
+        //
+        // TODO: this can't roll back pipes created by `createPipe` (ReadableStream, Blob,
+        // Firefox request-body); the `["pipe"]` frame and pump have already started, with
+        // no inverse on the `Exporter` interface, so they leak until session shutdown.
+        // Same caveat as the rollback in the static `devaluate` method above.
+        let anyE = <any>e;
+        let props: Record<string, unknown> | undefined;
+        let captureProp = (key: string, val: unknown) => {
+          let exportsBefore = this.exports?.length ?? 0;
+          try {
+            let encoded = this.devaluateImpl(val, e, depth + 1, path.concat(key));
+            if (!props) props = {};
+            props[key] = encoded;
+          } catch (err) {
+            // Drop this property; the error itself still propagates. Roll back any exports
+            // the partial walk produced.
+            if (this.exports && this.exports.length > exportsBefore) {
+              let tail = this.exports.splice(exportsBefore);
+              try {
+                this.exporter.unexport(tail);
+              } catch (err2) {
+                // probably a side effect of the original error, ignore it
+              }
+            }
+          }
+        };
+        for (let key of Object.keys(e)) {
+          if (key === "name" || key === "message" || key === "stack") continue;
+          captureProp(key, anyE[key]);
+        }
+        // `cause` is normally non-enumerable, so Object.keys() misses it.
+        if ("cause" in e) {
+          captureProp("cause", anyE.cause);
+        }
+        if (e instanceof AggregateError) {
+          captureProp("errors", e.errors);
+        }
+
+        // Backwards-compat: only emit the new tail elements when there's something to add.
+        // Errors with no extras serialize to the legacy 3- or 4-element form, byte-identical
+        // to what previous versions produced.
+        let result: unknown[] = ["error", e.name, e.message];
+        if (props) {
+          // Normalize the stack slot to null so `props` is always at index 4.
+          result.push(rewritten && rewritten.stack ? rewritten.stack : null);
+          result.push(props);
+        } else if (rewritten && rewritten.stack) {
           result.push(rewritten.stack);
         }
         return result;
@@ -459,6 +541,20 @@ function fixBrokenRequestBody(request: Request, body: ReadableStream): RpcPromis
   return new RpcPromise(new PromiseStubHook(promise), []);
 }
 
+// Unfortuntaely, even though Blobs can only be read asynchronously, there is no way to create
+// a blob backed by an asynchronous source; the bytes MUST all be provided upfront. This
+// effectively makes it impossible to manitain e-order when sending Blobs.
+//
+// As a compromise, we deliver a message as if it contained an RpcPromise that resolves to the
+// Blob. This has the effect that the RPC system will wait for the whole Blob to stream in before
+// delivering the message -- reusing the existing machinery for handling promises.
+function streamToBlobPromise(stream: ReadableStream, type: string): RpcPromise {
+  let promise = streamToBlob(stream, type).then(blob => {
+    return new PayloadStubHook(RpcPayload.fromAppReturn(blob));
+  });
+  return new RpcPromise(new PromiseStubHook(promise), []);
+}
+
 // Takes object trees parse from JSON and converts them into fully-hydrated JavaScript objects for
 // delivery to the app. This is used to implement deserialization, except that it doesn't actually
 // start from a raw string.
@@ -500,6 +596,9 @@ export class Evaluator {
           }
           break;
         case "date":
+          if (value[1] === null) {
+            return new Date(NaN);
+          }
           if (typeof value[1] == "number") {
             return new Date(value[1]);
           }
@@ -525,9 +624,25 @@ export class Evaluator {
         case "error":
           if (value.length >= 3 && typeof value[1] === "string" && typeof value[2] === "string") {
             let cls = ERROR_TYPES[value[1]] || Error;
-            let result = new cls(value[2]);
+            // AggregateError's constructor takes (errors, message); we pass an empty array
+            // and patch `errors` from the props bag below.
+            let result = cls === AggregateError ? new cls([], value[2]) : new cls(value[2]);
             if (typeof value[3] === "string") {
               result.stack = value[3];
+            }
+            // Optional 5th element: own properties bag. Unknown keys are assigned as own
+            // enumerable properties so the receiver sees what the sender attached.
+            if (value.length >= 5) {
+              let props = value[4];
+              if (!props || typeof props !== "object" || Array.isArray(props)) {
+                break;  // malformed; fall through to the "unknown special value" throw
+              }
+              let anyResult = <any>result;
+              let propsObj = <Record<string, unknown>>props;
+              for (let key of Object.keys(propsObj)) {
+                if (key === "name" || key === "message" || key === "stack") continue;
+                anyResult[key] = this.evaluateImpl(propsObj[key], result, key);
+              }
             }
             return result;
           }
@@ -628,6 +743,23 @@ export class Evaluator {
           }
 
           return new Response(body as BodyInit | null, init as ResponseInit);
+        }
+
+        case "blob": {
+          // Wire format is strictly ["blob", type, ["readable", id]] — the encoder always streams
+          // bytes through a pipe, so the content expression must evaluate to a ReadableStream.
+          if (value.length !== 3 || typeof value[1] !== "string") break;
+          let contentType = value[1] as string;
+          let content = this.evaluateImpl(value[2], parent, property);
+          if (!(content instanceof ReadableStream)) {
+            throw new TypeError("Blob content must be serialized as a ReadableStream.");
+          }
+          // Reuse the RpcPromise infrastructure (same pattern as fixBrokenRequestBody): the
+          // payload-delivery machinery resolves the promise and substitutes the real Blob before
+          // user code sees the value.
+          let promise = streamToBlobPromise(content, contentType);
+          this.promises.push({promise, parent, property});
+          return promise;
         }
 
         case "import":
