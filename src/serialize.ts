@@ -353,7 +353,7 @@ export class Devaluator {
         let captureProp = (key: string, val: unknown) => {
           let exportsBefore = this.exports?.length ?? 0;
           try {
-            let encoded = this.devaluateImpl(val, e, depth + 1);
+            let encoded = this.devaluateImpl(val, e, depth + 1, path.concat(key));
             if (!props) props = {};
             props[key] = encoded;
           } catch (err) {
