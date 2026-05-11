@@ -35,7 +35,13 @@ export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpc
 export { __experimental_newDurableObjectSessionStore } from "./hibernation.js";
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
 export type {
+  HibernatableEncryptedSnapshotEnvelope,
+  HibernatableSnapshotSecurity,
+  HibernatableSnapshotSecurityInput,
+  HibernatableSnapshotSecurityOpenInput,
+  HibernatableSnapshotStorageMode,
   HibernatableSessionStore,
+  HibernatableStoredSnapshot,
   HibernatableWebSocketAttachment,
   RpcSessionSnapshot,
   RpcSessionSnapshotImport,

@@ -8,7 +8,11 @@ import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import type { RpcTraceEvent } from "./rpc.js";
 import type {
+  HibernatableEncryptedSnapshotEnvelope,
+  HibernatableSnapshotSecurity,
+  HibernatableSnapshotStorageMode,
   HibernatableSessionStore,
+  HibernatableStoredSnapshot,
   HibernatableWebSocketAttachment,
   RpcSessionSnapshot,
 } from "./hibernation.js";
@@ -47,11 +51,22 @@ export function newWorkersWebSocketRpcResponse(
 
 export type HibernatableWebSocketOptions = RpcSessionOptions & {
   /** Optional session store for persisting snapshots to durable storage.
-   *  When provided, the full snapshot is stored here instead of in the
-   *  WebSocket attachment (which has a 2048-byte limit in workerd). The
-   *  attachment will only contain the session ID for restore lookup. */
+   *  When provided, the snapshot (or encrypted snapshot envelope) is stored
+   *  here instead of in the WebSocket attachment (which has a 2048-byte limit
+   *  in workerd). The attachment keeps only session lookup metadata. */
   sessionStore?: HibernatableSessionStore;
   sessionId?: string;
+  /**
+   * Optional snapshot encryption hook. When supplied, capnweb stores encrypted
+   * snapshot envelopes instead of plaintext snapshots in both WebSocket
+   * attachments and external session stores.
+   */
+  snapshotSecurity?: HibernatableSnapshotSecurity;
+  /**
+   * Additional authenticated context to bind to the snapshot, e.g. a verified user
+   * ID or room ID. `sessionId` and storage mode are always included by capnweb.
+   */
+  snapshotSecurityAssociatedData?: unknown;
   __experimental_trace?: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => void;
 };
 
@@ -95,8 +110,30 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     }
   };
 
-  let snapshot = attachment?.snapshot
-      ?? (options.sessionStore ? await options.sessionStore.load(sessionId) : undefined);
+  const storageMode: HibernatableSnapshotStorageMode = options.sessionStore ? "sessionStore" : "inline";
+  const associatedData = makeSnapshotAssociatedData(
+    sessionId,
+    storageMode,
+    options.snapshotSecurityAssociatedData,
+  );
+  let storedSnapshot: HibernatableStoredSnapshot | undefined =
+    attachment?.snapshotEnvelope ?? attachment?.snapshot;
+  let sessionStoreSnapshotKnownPersisted = false;
+  if (storedSnapshot === undefined && options.sessionStore) {
+    storedSnapshot = await options.sessionStore.load(sessionId);
+    sessionStoreSnapshotKnownPersisted = storedSnapshot !== undefined;
+  }
+
+  let snapshot: RpcSessionSnapshot | undefined;
+  try {
+    snapshot = await openStoredSnapshot(storedSnapshot);
+  } catch (_err) {
+    try { webSocket.close(1011, 'invalid snapshot'); } catch {}
+    if (options.sessionStore) {
+      await options.sessionStore.delete(sessionId);
+    }
+    return undefined;
+  }
 
   let rpc!: RpcSession;
   let persistScheduled = false;
@@ -171,25 +208,107 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
   async function persistSnapshot() {
     try {
       let snap = rpc.__experimental_snapshot();
-      if (options.sessionStore) {
-        // When a session store is available, persist the full snapshot there
-        // (no size limit) and only store the session ID in the attachment
-        // (which has a 2048-byte limit in workerd).
-        await options.sessionStore.save(sessionId, snap);
+      let snapshotJson = JSON.stringify(snap);
+      let existing = getAttachmentRecord(webSocket);
+      let existingCapnweb = getAttachmentFromRaw(existing);
+      let snapshotFingerprint = options.snapshotSecurity
+        ? await options.snapshotSecurity.fingerprint({ plaintext: snapshotJson, associatedData })
+        : undefined;
+      let canReuseExistingSecurityEnvelope = !!snapshotFingerprint &&
+          existingCapnweb?.snapshotFingerprint === snapshotFingerprint;
+      if (options.sessionStore && !sessionStoreSnapshotKnownPersisted) {
+        canReuseExistingSecurityEnvelope = false;
       }
 
-      // Namespace capnweb data under __capnweb in the attachment so we don't
-      // clobber other libraries (e.g. partyserver) that also use the attachment
-      // for their own per-connection metadata.
-      let capnwebData: HibernatableWebSocketAttachment = options.sessionStore
-        ? { sessionId, version: 1 satisfies 1 }
-        : { sessionId, version: 1 satisfies 1, snapshot: snap };
-      let existing = webSocket.deserializeAttachment() ?? {};
-      if (typeof existing !== "object" || existing === null) existing = {};
-      webSocket.serializeAttachment({ ...existing, __capnweb: capnwebData });
+      let capnwebData: HibernatableWebSocketAttachment;
+      let stored: HibernatableStoredSnapshot | undefined;
+      if (options.snapshotSecurity) {
+        if (canReuseExistingSecurityEnvelope && existingCapnweb) {
+          capnwebData = existingCapnweb;
+        } else {
+          const envelope = await sealSnapshot(snapshotJson, snapshotFingerprint);
+          stored = envelope;
+          capnwebData = options.sessionStore
+            ? {
+                sessionId,
+                version: 3 satisfies 3,
+                snapshotFingerprint: envelope.fingerprint,
+              }
+            : {
+                sessionId,
+                version: 3 satisfies 3,
+                snapshotEnvelope: envelope,
+                snapshotFingerprint: envelope.fingerprint,
+              };
+        }
+      } else {
+        stored = snap;
+        capnwebData = options.sessionStore
+          ? { sessionId, version: 2 satisfies 2 }
+          : { sessionId, version: 2 satisfies 2, snapshot: snap };
+      }
+
+      let nextAttachment = { ...existing, __capnweb: capnwebData };
+
+      if (options.sessionStore) {
+        // When a session store is available, persist the full snapshot there
+        // (no size limit) and only store compact metadata in the attachment.
+        if (!snapshotFingerprint ||
+            !sessionStoreSnapshotKnownPersisted ||
+            existingCapnweb?.snapshotFingerprint !== snapshotFingerprint) {
+          await options.sessionStore.save(sessionId, stored ?? snap);
+          sessionStoreSnapshotKnownPersisted = true;
+        }
+      }
+
+      if (JSON.stringify(existing) !== JSON.stringify(nextAttachment)) {
+        webSocket.serializeAttachment(nextAttachment);
+      }
     } catch (err) {
       transport.abort?.(err);
     }
+  }
+
+  async function openStoredSnapshot(stored: HibernatableStoredSnapshot | undefined):
+      Promise<RpcSessionSnapshot | undefined> {
+    if (!stored) return undefined;
+
+    if (isEncryptedSnapshotEnvelope(stored)) {
+      if (!options.snapshotSecurity) {
+        throw new Error("Encrypted snapshot requires snapshotSecurity.open().");
+      }
+      if (stored.fingerprint &&
+          attachment?.snapshotFingerprint &&
+          stored.fingerprint !== attachment.snapshotFingerprint) {
+        throw new Error("Encrypted snapshot fingerprint does not match the WebSocket attachment.");
+      }
+      const plaintext = await options.snapshotSecurity.open({ envelope: stored, associatedData });
+      return JSON.parse(plaintext) as RpcSessionSnapshot;
+    }
+
+    if (options.snapshotSecurity?.required) {
+      throw new Error("Plaintext snapshot rejected because snapshotSecurity is required.");
+    }
+
+    return stored;
+  }
+
+  async function sealSnapshot(
+      snapshotJson: string,
+      snapshotFingerprint: string | undefined): Promise<HibernatableEncryptedSnapshotEnvelope> {
+    if (!options.snapshotSecurity) {
+      throw new Error("snapshotSecurity is required to seal an encrypted snapshot.");
+    }
+
+    const envelope = await options.snapshotSecurity.seal({
+      plaintext: snapshotJson,
+      associatedData,
+    });
+
+    return {
+      ...envelope,
+      ...(envelope.fingerprint ? {} : { fingerprint: snapshotFingerprint }),
+    };
   }
 }
 
@@ -264,15 +383,47 @@ export function __experimental_hibernatableWebSocketSessionId(
 }
 
 function getAttachment(webSocket: WebSocket): HibernatableWebSocketAttachment | undefined {
-  let raw = webSocket.deserializeAttachment() as Record<string, unknown> | null | undefined;
+  return getAttachmentFromRaw(webSocket.deserializeAttachment());
+}
+
+function getAttachmentFromRaw(raw: unknown): HibernatableWebSocketAttachment | undefined {
   // Look for capnweb data under __capnweb namespace first (coexistence with
   // other libraries), falling back to the raw attachment for backwards compat.
-  let attachment = (raw?.__capnweb ?? raw) as HibernatableWebSocketAttachment | null | undefined;
-  if (attachment?.version === 1 && typeof attachment.sessionId === "string") {
+  let rawRecord = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : undefined;
+  let attachment = (rawRecord?.__capnweb ?? raw) as HibernatableWebSocketAttachment | null | undefined;
+  if ((attachment?.version === 1 || attachment?.version === 2 || attachment?.version === 3) &&
+      typeof attachment.sessionId === "string") {
     return attachment;
   }
 
   return undefined;
+}
+
+function getAttachmentRecord(webSocket: WebSocket): Record<string, unknown> {
+  let existing = webSocket.deserializeAttachment();
+  if (typeof existing !== "object" || existing === null) return {};
+  return existing as Record<string, unknown>;
+}
+
+function isEncryptedSnapshotEnvelope(value: unknown): value is HibernatableEncryptedSnapshotEnvelope {
+  if (typeof value !== "object" || value === null) return false;
+  const envelope = value as HibernatableEncryptedSnapshotEnvelope;
+  return envelope.kind === "encrypted" &&
+      typeof envelope.alg === "string" &&
+      typeof envelope.nonce === "string" &&
+      typeof envelope.ciphertext === "string";
+}
+
+function makeSnapshotAssociatedData(
+    sessionId: string,
+    storageMode: HibernatableSnapshotStorageMode,
+    associatedData: unknown): string {
+  return [
+    "capnweb-hibernatable-websocket-snapshot-v1",
+    storageMode,
+    sessionId,
+    JSON.stringify(associatedData ?? null),
+  ].join("\n");
 }
 
 function makeSessionId(): string {

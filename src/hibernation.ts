@@ -48,20 +48,60 @@ export type RpcSessionSnapshot = {
   importReplays?: RpcSessionExportProvenance[];
 };
 
+export type HibernatableSnapshotStorageMode = "inline" | "sessionStore";
+
+export type HibernatableEncryptedSnapshotEnvelope = {
+  kind: "encrypted";
+  alg: string;
+  nonce: string;
+  ciphertext: string;
+  /** Deterministic, keyed marker for write elision. Not used for decryption. */
+  fingerprint?: string;
+};
+
+export type HibernatableStoredSnapshot =
+  | RpcSessionSnapshot
+  | HibernatableEncryptedSnapshotEnvelope;
+
+export type HibernatableSnapshotSecurityInput = {
+  plaintext: string;
+  associatedData: string;
+};
+
+export type HibernatableSnapshotSecurityOpenInput = {
+  envelope: HibernatableEncryptedSnapshotEnvelope;
+  associatedData: string;
+};
+
+export interface HibernatableSnapshotSecurity {
+  /** Refuse to restore snapshots that are not encrypted envelopes. */
+  required?: boolean;
+  fingerprint(input: HibernatableSnapshotSecurityInput): string | Promise<string>;
+  seal(input: HibernatableSnapshotSecurityInput):
+      HibernatableEncryptedSnapshotEnvelope | Promise<HibernatableEncryptedSnapshotEnvelope>;
+  open(input: HibernatableSnapshotSecurityOpenInput): string | Promise<string>;
+}
+
 /**
  * Everything needed to resume an RPC session after hibernation, stored in the
  * WebSocket attachment via workerd's serializeAttachment API.
  */
 export type HibernatableWebSocketAttachment = {
   sessionId: string;
-  version: 1;
-  /** Full RPC session snapshot, persisted per-connection. */
+  version: 1 | 2 | 3;
+  /** Legacy/plaintext full RPC session snapshot, persisted per-connection. */
   snapshot?: RpcSessionSnapshot;
+  /** Encrypted full RPC session snapshot, persisted per-connection. */
+  snapshotEnvelope?: HibernatableEncryptedSnapshotEnvelope;
+  /** Legacy authentication marker used by version 2 attachments. */
+  snapshotMac?: string;
+  /** Deterministic keyed marker for the currently persisted snapshot. */
+  snapshotFingerprint?: string;
 };
 
 export interface HibernatableSessionStore {
-  load(sessionId: string): Promise<RpcSessionSnapshot | undefined>;
-  save(sessionId: string, snapshot: RpcSessionSnapshot): Promise<void>;
+  load(sessionId: string): Promise<HibernatableStoredSnapshot | undefined>;
+  save(sessionId: string, snapshot: HibernatableStoredSnapshot): Promise<void>;
   delete(sessionId: string): Promise<void>;
 
   /**
@@ -89,10 +129,10 @@ export function __experimental_newDurableObjectSessionStore(
   return {
     async load(sessionId: string) {
       const value = await storage.get(`${prefix}${sessionId}`);
-      return value as RpcSessionSnapshot | undefined;
+      return value as HibernatableStoredSnapshot | undefined;
     },
 
-    async save(sessionId: string, snapshot: RpcSessionSnapshot) {
+    async save(sessionId: string, snapshot: HibernatableStoredSnapshot) {
       await storage.put(`${prefix}${sessionId}`, snapshot);
     },
 
