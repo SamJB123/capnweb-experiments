@@ -1,22 +1,36 @@
 # capnweb
 
-## 0.7.0-hibernation.0
+## 0.8.0-hibernation.0
 
-Rebased the `capnweb-experimental-hibernation` fork onto upstream `capnweb` 0.7.0.
+Rebased the `capnweb-experimental-hibernation` fork onto upstream `capnweb` 0.8.0.
 
 ### Picked up from upstream
 
+- **0.8.0** ([#155](https://github.com/cloudflare/capnweb/pull/155)) — Added `Blob` as a serializable type over RPC. `Blob` objects can now be passed as call arguments and return values. The MIME type (`blob.type`) is preserved across the wire.
+- **0.8.0** ([#166](https://github.com/cloudflare/capnweb/pull/166)) — Errors' own properties (via `Object.keys()`) are now preserved across the wire. Attach fields like `code` or `details` to an `Error` and they propagate to the other side. `cause` and `AggregateError.errors` are also preserved.
+- **0.8.0** ([#168](https://github.com/cloudflare/capnweb/pull/168)) — Fixed a memory leak that kept all messages received in a session pinned in memory until the session ended, due to surprising implementation details of JavaScript Promises.
+- **0.8.0** ([#152](https://github.com/cloudflare/capnweb/pull/152)) — Fixed serialization for Invalid/NaN `Date` values.
 - **0.7.0** ([#159](https://github.com/cloudflare/capnweb/pull/159)) — Added support for Bun's alternative WebSocket server API.
-- ([#155](https://github.com/cloudflare/capnweb/pull/155)) — Added `Blob` as a serializable type over RPC. `Blob` objects can now be passed as call arguments and return values. The MIME type (`blob.type`) is preserved across the wire.
-- ([#166](https://github.com/cloudflare/capnweb/pull/166)) — Errors' own properties (via `Object.keys()`) are now preserved across the wire. Attach fields like `code` or `details` to an `Error` and they propagate to the other side. `cause` and `AggregateError.errors` are also preserved.
-- ([#168](https://github.com/cloudflare/capnweb/pull/168)) — Fixed a memory leak that kept all messages received in a session pinned in memory until the session ended, due to surprising implementation details of JavaScript Promises.
-- ([#152](https://github.com/cloudflare/capnweb/pull/152)) — Fixed serialization for Invalid/NaN `Date` values.
 
 ### Hibernation fork carry-overs (previously released as 0.6.5)
 
 - `HibernatableWebSocketSession<T>` is now generic and `getRemoteMain()` returns `RpcStub<T>`. Both `__experimental_newHibernatableWebSocketRpcSession<T>` and `__experimental_resumeHibernatableWebSocketRpcSession<T>` now thread `T` through to the returned session, eliminating the need for `as unknown as RpcStub<T>` at every call site that needs the worker-side capability.
 - Fixed an import-table leak in `sendCall`, `sendStream`, and `sendMap` when the args payload fails to serialize (e.g. non-serializable argument). The import-table entry is now allocated *after* `Devaluator.devaluate` succeeds, mirroring the upstream first-party shape and avoiding the orphan slot left behind on throw.
 - Fixed an export leak / spurious `toJSON` RPC call triggered by snapshot capture in the `push` and `stream` receive handlers. `cloneRpcExpr(msg[2])` is now called once *before* `evaluateWithCurrentProvenance` mutates the expression in place; reusing the pre-mutation clone for both `importReplays` and `sourceExpr` prevents `JSON.stringify` from probing live `RpcStub` proxies created during evaluation.
+
+## 0.8.0
+
+### Minor Changes
+
+- [#155](https://github.com/cloudflare/capnweb/pull/155) [`48f4d49`](https://github.com/cloudflare/capnweb/commit/48f4d495ef66e947612e80f36f4f9570b439e407) Thanks [@G4brym](https://github.com/G4brym)! - Add `Blob` as a serializable type over RPC. `Blob` objects can now be passed as call arguments and return values. The MIME type (`blob.type`) is preserved across the wire.
+
+### Patch Changes
+
+- [#166](https://github.com/cloudflare/capnweb/pull/166) [`7413e43`](https://github.com/cloudflare/capnweb/commit/7413e43b251a0db79e9c59e67d37f01c725818fe) Thanks [@aron-cf](https://github.com/aron-cf)! - Errors properties, using `Object.keys()`, are now preserved across the wire. Attach fields like `code` or `details` to an `Error` and they propagate to the other side. The `cause` and `errors` (for `AggregateError`) properties will also be preserved.
+
+- [#168](https://github.com/cloudflare/capnweb/pull/168) [`25baebf`](https://github.com/cloudflare/capnweb/commit/25baebf7facfcdafb8cd46ea20b982cbc05557a4) Thanks [@kentonv](https://github.com/kentonv)! - Fix memory leak that kept all messages received in a session pinned in memory until the session ended, due to surprising implementation details of JavaScript Promises.
+
+- [#152](https://github.com/cloudflare/capnweb/pull/152) [`9e499e2`](https://github.com/cloudflare/capnweb/commit/9e499e2ac38dd4b57403d7e3d3294412bfbace14) Thanks [@VastBlast](https://github.com/VastBlast)! - Fix serialization for Invalid/NaN dates
 
 ## 0.7.0
 
