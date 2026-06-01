@@ -2,7 +2,27 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "WebFetch(domain:developers.cloudflare.com)"
+      "WebFetch(domain:developers.cloudflare.com)",
+      "WebFetch(domain:spacetimedb.com)",
+      "WebFetch(domain:stack.convex.dev)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.convex.dev)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\sambi\\\\Github\\\\reference-material\\\\convex-backend\\\\npm-packages\\\\convex\\\\src\\\\browser\" -Recurse -Filter \"*.ts\" -Filter \"*.tsx\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Head -30)",
+      "Bash(Get-ChildItem *)",
+      "Bash(xargs grep -l \"export\")",
+      "Bash(xargs grep -l \"sync\\\\|websocket\")",
+      "WebFetch(domain:docs.livestore.dev)",
+      "WebFetch(domain:dev.docs.livestore.dev)",
+      "WebFetch(domain:blog.cloudflare.com)",
+      "WebFetch(domain:lilting.ch)",
+      "WebFetch(domain:www.startuphub.ai)",
+      "Bash(Select-Object Name)",
+      "Bash(Select-Object -First 50)",
+      "Bash(xargs grep -l \"sub\\\\|facet\")",
+      "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\aicolab\\\\room-service\")"
     ]
   }
 }
