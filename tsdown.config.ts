@@ -40,4 +40,11 @@ export default defineConfig([
     ...common,
     entry: ['src/index-bun.ts'],
   },
+  {
+    ...common,
+    // Optional CBOR codec, published at the "capnweb/codec/cbor" subpath. Kept as
+    // its own entry so cbor-x is only loaded when a consumer imports this subpath.
+    // The object key sets the output name: dist/codec/cbor.{js,cjs,d.ts}.
+    entry: { 'codec/cbor': 'src/codec/cbor/index.ts' },
+  },
 ])

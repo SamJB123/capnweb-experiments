@@ -21,6 +21,7 @@ export default defineConfig({
             '__tests__/index.test.ts',
             '__tests__/flow-control.test.ts',
             '__tests__/hibernation-persistence.test.ts',
+            '__tests__/cbor.test.ts',
           ],
           environment: 'node',
         },

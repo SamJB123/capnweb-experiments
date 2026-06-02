@@ -24,6 +24,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./codec/cbor": {
+      "types": "./dist/codec/cbor.d.ts",
+      "import": "./dist/codec/cbor.js",
+      "require": "./dist/codec/cbor.cjs"
     }
   },
   "type": "module",
@@ -49,6 +54,7 @@
     "@types/bun": "^1.2.0",
     "@types/ws": "^8.18.1",
     "@vitest/browser": "^3.2.4",
+    "cbor-x": "^1.6.4",
     "pkg-pr-new": "^0.0.60",
     "playwright": "^1.56.1",
     "tsdown": "^0.22.0",
@@ -56,6 +62,14 @@
     "typescript": "^5.9.3",
     "vitest": "^3.2.4",
     "ws": "^8.19.0"
+  },
+  "peerDependencies": {
+    "cbor-x": "^1.6.0"
+  },
+  "peerDependenciesMeta": {
+    "cbor-x": {
+      "optional": true
+    }
   },
   "repository": {
     "type": "git",
