@@ -57,7 +57,35 @@ function decodeGuard(wire: string | Uint8Array): Uint8Array {
  *   on the wire, so a fresh encoder simply re-emits definitions on resume (a few
  *   larger messages until it re-warms). This is the one place the codec is even
  *   simpler than capability hibernation, which needs provenance to rebuild live
- *   objects.
+ *   objects. (cbor-x also doesn't expose the encoder's table, so restarting it
+ *   fresh is the only option — but as below, it's also the *correct* one.)
+ *
+ * ### Why restarting the encoder fresh is correct (not just convenient)
+ *
+ * cbor-x structure ids are **absolute** — baked into the CBOR record tag, not
+ * positional. So when a fresh encoder re-defines a shape, the peer's decoder
+ * **overwrites** the slot at that id rather than appending. And a fresh encoder
+ * always emits a definition (overwriting the peer's slot) **before** it ever
+ * references that id. Therefore every definition-less reference it later sends
+ * points at a slot it just redefined and the peer just overwrote — they cannot
+ * disagree, even if the fresh encoder assigns ids in a different order than
+ * before hibernation. Re-defining is self-correcting; this is why we never need
+ * to preserve encoder state.
+ *
+ * ### Glossary size is bounded by a high-water mark
+ *
+ * Because ids reset to 0 each connection-life and definitions overwrite, a
+ * receiver's decoder table (what it persists in its DO WebSocket attachment)
+ * does NOT accumulate across the peer's repeated hibernations. Its length equals
+ * the most distinct object shapes the peer defined in any *single* life — not the
+ * sum across lives. Slots above the current life's shape count may hold harmless
+ * stale leftovers (never referenced, since the fresh encoder only references ids
+ * it redefined this life); there is no active GC, but the overwrite behavior caps
+ * total size at that high-water mark. (A peer that resets to id 0 each life thus
+ * keeps the table *smaller* than a never-hibernating sequential sender, whose ids
+ * grow with lifetime-total distinct shapes.) Note structures only form for object
+ * shapes, not capnweb's array-based protocol envelope, so this is driven by
+ * object-heavy user payloads.
  */
 export function createCborCodec(options: CborCodecOptions = {}): Codec {
   if (!options.stateful) {
