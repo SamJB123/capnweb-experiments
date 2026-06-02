@@ -64,7 +64,7 @@
     "ws": "^8.19.0"
   },
   "peerDependencies": {
-    "cbor-x": "^1.6.0"
+    "cbor-x": "^1.6.4"
   },
   "peerDependenciesMeta": {
     "cbor-x": {
