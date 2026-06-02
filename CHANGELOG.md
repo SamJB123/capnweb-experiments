@@ -1,5 +1,18 @@
 # capnweb
 
+## 0.8.0-hibernation-cbor.2
+
+Experimental prerelease (npm `experimental` dist-tag). Iterates on the CBOR codec from `0.8.0-hibernation-cbor.1`.
+
+### Added
+
+- **Native bytes for binary codecs.** A `Uint8Array` is no longer base64-encoded before reaching the codec when the codec carries binary natively — CBOR now stores a compact byte string instead of inflated base64 text (~33% smaller for binary payloads; the win scales with payload size). The `["bytes", …]` token shape is unchanged; only the payload representation differs, and only on a binary codec.
+  - Implemented as a minimal, codec-agnostic core hook: `Exporter` gains an optional `wantsBinaryBytes()`; the `Devaluator` emits raw bytes when it returns true (else the existing base64 path, unchanged) and the `Evaluator` additionally accepts a raw `Uint8Array`. The default JSON codec leaves `Codec.binary` unset, so the JSON/text wire is byte-identical and can never accidentally emit raw bytes.
+
+### Notes
+
+- Still experimental, not yet validated in a live runtime. Both ends of a session must use the same codec (and matching `optimizeEnvelope`).
+
 ## 0.8.0-hibernation-cbor.1
 
 Experimental prerelease (npm `experimental` dist-tag). Iterates on the optional CBOR codec from `0.8.0-hibernation-cbor.0`.
