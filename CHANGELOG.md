@@ -1,5 +1,18 @@
 # capnweb
 
+## 0.8.0-hibernation-cbor.1
+
+Experimental prerelease (npm `experimental` dist-tag). Iterates on the optional CBOR codec from `0.8.0-hibernation-cbor.0`.
+
+### Added
+
+- **Envelope optimization** (`createCborCodec({ optimizeEnvelope: true })`). capnweb's protocol envelope is tagged *arrays* (`["push", …]`, `["pipeline", …]`, `["setPose"]`), which cbor-x's structure-sharing cannot compress. This reshapes every string-headed protocol array into a one-key map `{ <tag>: [args] }` carried under a private CBOR tag, so the repeated tag/method strings become a shared structure id after first use. Most effective with `stateful: true`. Measured on a high-frequency pose update (push + release): JSON 79B → stateless/stateful CBOR 58B → stateful + envelope **47B** (~41% under JSON). This is what makes the stateful structure table actually pay off for the array-based protocol.
+  - The reshape is a **provably injective bijection** carried under a disjoint CBOR-tag namespace, so user data can never be decoded as a protocol token: a user object `{push:[…]}` stays an untagged map. Forged tags from a hostile peer (wrapping non-objects, empty/multi-key maps, etc.) are rejected. Backed by an adversarial test suite (28 cases) plus a `__proto__`/prototype-pollution guard.
+
+### Notes
+
+- Still experimental and not yet validated in a live runtime (real WebSocket / Durable Object hibernate-wake). Both ends of a session must use the same codec **and** the same `optimizeEnvelope` setting.
+
 ## 0.8.0-hibernation-cbor.0
 
 Experimental prerelease published under the npm `experimental` dist-tag (not `latest`, which stays at `0.8.0-hibernation.0`). Adds an **optional CBOR wire codec** as an alternative to the default JSON wire format, to reduce bytes on the wire. Built on top of `0.8.0-hibernation.0`.
