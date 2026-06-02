@@ -114,10 +114,12 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
 
   if (!options.stateful) {
     // Stateless: a single Encoder instance both encodes and decodes; no shared
-    // structure table, so each message stands alone.
-    const encoder = new Encoder({ useRecords: false });
+    // structure table, so each message stands alone. tagUint8Array:false → byte
+    // arrays encode as bare CBOR byte strings (no extra tag).
+    const encoder = new Encoder({ useRecords: false, tagUint8Array: false });
     return {
       id: "cbor" + protoSuffix,
+      binary: true,
       encode(message: unknown): Uint8Array {
         return encoder.encode(prep(message));
       },
@@ -130,13 +132,14 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
   // Stateful: separate encoder/decoder instances so the two directions keep
   // independent structure tables. Only the decoder is given a structures array
   // (which cbor-x populates as it learns); that array is what we snapshot.
-  const SEQ = { useRecords: true, sequential: true } as const;
+  const SEQ = { useRecords: true, sequential: true, tagUint8Array: false } as const;
   let decoderStructures: object[] = [];
   let encoder = new Encoder({ ...SEQ });
   let decoder = new Decoder({ ...SEQ, structures: decoderStructures });
 
   return {
     id: "cbor-sequential" + protoSuffix,
+    binary: true,
 
     encode(message: unknown): Uint8Array {
       return encoder.encode(prep(message));

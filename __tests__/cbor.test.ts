@@ -6,7 +6,7 @@ import { expect, it, describe } from "vitest";
 import { Encoder, Tag } from "cbor-x";
 import { RpcSession, RpcTarget, type RpcTransport } from "../src/index.js";
 import { createCborCodec } from "../src/codec/cbor/index.js";
-import type { Codec } from "../src/codec/index.js";
+import { jsonCodec, type Codec } from "../src/codec/index.js";
 
 // ---------------------------------------------------------------------------
 // Codec-level round-trip: encode then decode must reproduce the devalued message.
@@ -641,5 +641,93 @@ describe("envelope optimization — adversarial security", () => {
       // Equivalent to what JSON would faithfully preserve — proves no aliasing.
       expect(roundTrips(msg)).toEqual(JSON.parse(JSON.stringify(msg)));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Native bytes: a binary codec carries Uint8Array raw; the JSON/text path is
+// untouched and can NEVER accidentally emit raw bytes. Exercised through real
+// RPC sessions (the devaluator/evaluator only run there).
+// ---------------------------------------------------------------------------
+
+describe("native bytes — raw on binary codecs, base64 on JSON (no accidental landing)", () => {
+  // Transport that records every frame it sends, so we can inspect the wire.
+  class CapTransport implements RpcTransport {
+    partner!: CapTransport;
+    sent: (string | Uint8Array)[] = [];
+    private q: (string | Uint8Array)[] = [];
+    private waiter?: () => void;
+    async send(m: string | Uint8Array): Promise<void> {
+      this.sent.push(m);
+      this.partner.q.push(m);
+      this.partner.waiter?.();
+      this.partner.waiter = undefined;
+    }
+    async receive(): Promise<string | Uint8Array> {
+      while (this.q.length === 0) await new Promise<void>(r => { this.waiter = r; });
+      return this.q.shift()!;
+    }
+  }
+  function capPair(): [CapTransport, CapTransport] {
+    const a = new CapTransport(), b = new CapTransport();
+    a.partner = b; b.partner = a;
+    return [a, b];
+  }
+  // Echo `bytes` through a session pair; return the result + the client's sent frames.
+  async function echoBytes(codec: Codec | undefined, bytes: Uint8Array) {
+    const [ct, st] = capPair();
+    const opts = codec ? { codec } : {};
+    const server = new RpcSession(st, new TestApi(), opts);
+    const client = new RpcSession<TestApi>(ct, undefined, opts);
+    using stub = client.getRemoteMain();
+    const result = await stub.echo(bytes);
+    void server;
+    return { result, clientSent: ct.sent };
+  }
+
+  const POSE = new Uint8Array([0xf1, 0xfc, 0x00, 0x00, 0xfc, 0x02, 0x01, 0x00]);
+  const POSE_B64 = Buffer.from(POSE).toString("base64").replace(/=+$/, "");
+
+  it("only binary codecs declare `binary`; JSON never does (the opt-in lock)", () => {
+    expect(jsonCodec.binary).toBeFalsy();
+    expect(createCborCodec().binary).toBe(true);
+    expect(createCborCodec({ stateful: true }).binary).toBe(true);
+    expect(createCborCodec({ stateful: true, optimizeEnvelope: true }).binary).toBe(true);
+  });
+
+  it("JSON (default codec) sends bytes as base64 TEXT, never raw — and round-trips", async () => {
+    const { result, clientSent } = await echoBytes(undefined, POSE);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(POSE));
+    // Every outbound frame is text, and the bytes ride as the base64 string.
+    expect(clientSent.every(f => typeof f === "string")).toBe(true);
+    expect(clientSent.some(f => typeof f === "string" && f.includes(POSE_B64))).toBe(true);
+  });
+
+  it("CBOR codec sends bytes RAW (binary frames), and the base64 text never appears", async () => {
+    const { result, clientSent } = await echoBytes(createCborCodec({ stateful: true }), POSE);
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(POSE));
+    expect(clientSent.some(f => f instanceof Uint8Array)).toBe(true);
+    const anyFrameHasB64 = clientSent.some(f => {
+      const s = typeof f === "string" ? f : Buffer.from(f).toString("latin1");
+      return s.includes(POSE_B64);
+    });
+    expect(anyFrameHasB64).toBe(false);
+  });
+
+  it("CBOR + optimizeEnvelope keeps a Uint8Array an opaque leaf and round-trips", async () => {
+    const { result } = await echoBytes(createCborCodec({ stateful: true, optimizeEnvelope: true }), POSE);
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result as Uint8Array)).toEqual(Array.from(POSE));
+  });
+
+  it("raw bytes beat base64 on a larger payload", async () => {
+    const big = new Uint8Array(512);
+    for (let i = 0; i < big.length; i++) big[i] = (i * 7) & 0xff;
+    const cbor = await echoBytes(createCborCodec({ stateful: true, optimizeEnvelope: true }), big);
+    const json = await echoBytes(undefined, big);
+    const frameMax = (frames: (string | Uint8Array)[]) =>
+      Math.max(...frames.map(f => (typeof f === "string" ? f.length : f.byteLength)));
+    expect(frameMax(cbor.clientSent)).toBeLessThan(frameMax(json.clientSent));
   });
 });

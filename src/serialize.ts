@@ -24,6 +24,13 @@ export interface Exporter {
   createPipe(readable: ReadableStream, hook: StubHook): ImportId;
 
   onSendError(error: Error): Error | void;
+
+  // Optional. If this returns true, byte arrays are devalued as raw `Uint8Array`
+  // (`["bytes", <Uint8Array>]`) instead of base64 text (`["bytes", "<base64>"]`),
+  // for transports whose wire format can carry binary natively. Omitted/false by
+  // default, so the standard (text/JSON) path is unaffected. Codec-agnostic — this
+  // interface knows nothing about any specific codec.
+  wantsBinaryBytes?(): boolean;
 }
 
 class NullExporter implements Exporter {
@@ -164,6 +171,12 @@ export class Devaluator {
 
       case "bytes": {
         let bytes = value as Uint8Array;
+        // Transports that carry binary natively (e.g. a CBOR codec) take the raw
+        // bytes; the token shape ["bytes", …] is unchanged. The default path below
+        // (base64 text) is untouched, so JSON/text transports are byte-identical.
+        if (this.exporter.wantsBinaryBytes?.()) {
+          return ["bytes", bytes];
+        }
         if (bytes.toBase64) {
           return ["bytes", bytes.toBase64({omitPadding: true})];
         }
@@ -604,6 +617,11 @@ export class Evaluator {
           }
           break;
         case "bytes": {
+          // Raw bytes from a binary transport (see Devaluator). Additive: a text
+          // transport never carries a Uint8Array here, so this branch is inert for it.
+          if (value[1] instanceof Uint8Array) {
+            return value[1];
+          }
           if (typeof value[1] == "string") {
             if (typeof Buffer !== "undefined") {
               return Buffer.from(value[1], "base64");

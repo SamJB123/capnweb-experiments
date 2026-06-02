@@ -487,6 +487,13 @@ class RpcSessionImpl implements Importer, Exporter {
     this.readLoop().catch(err => this.abort(err));
   }
 
+  // Exporter capability: defer to the wire codec. Only a codec that declares
+  // `binary` (the CBOR codec) opts into raw-byte devaluation; the default JSON
+  // codec leaves it falsy, so the text path is never taken accidentally.
+  wantsBinaryBytes(): boolean {
+    return !!this.codec.binary;
+  }
+
   private trace(phase: string, detail?: Record<string, unknown>) {
     try {
       this.options.__experimental_trace?.({

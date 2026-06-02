@@ -109,6 +109,9 @@ export function ensureProtocolTokenExtension(): void {
  * {@link fromProtocolTokens} is its exact inverse on decode.
  */
 export function toProtocolTokens(value: unknown): unknown {
+  // A Uint8Array (raw bytes from a binary codec) is an opaque leaf — never recurse
+  // into it as an object, or it would be shredded into {0:…,1:…}.
+  if (value instanceof Uint8Array) return value;
   if (Array.isArray(value)) {
     if (value.length >= 1 && typeof value[0] === "string") {
       const rest = new Array(value.length - 1);
@@ -151,6 +154,8 @@ export function fromProtocolTokens(value: unknown): unknown {
   if (value instanceof ProtocolToken) {
     return [value.head, ...value.rest.map(fromProtocolTokens)];
   }
+  // Raw bytes are an opaque leaf (see toProtocolTokens).
+  if (value instanceof Uint8Array) return value;
   if (Array.isArray(value)) {
     return value.map(fromProtocolTokens);
   }

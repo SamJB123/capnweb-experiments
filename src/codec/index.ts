@@ -23,6 +23,15 @@ export interface Codec {
    */
   readonly id: string;
 
+  /**
+   * OPTIONAL. If true, this codec can carry a raw `Uint8Array` natively on the
+   * wire, so the session devalues byte arrays as raw bytes (`["bytes", <bytes>]`)
+   * rather than base64 text. Only set this on a codec whose `encode` genuinely
+   * round-trips a `Uint8Array` (e.g. CBOR). The default JSON codec leaves it
+   * unset, so the text wire format is never affected.
+   */
+  readonly binary?: boolean;
+
   /** Encode a devalued message for the wire. */
   encode(message: unknown): string | Uint8Array;
 
