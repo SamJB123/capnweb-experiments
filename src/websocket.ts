@@ -438,6 +438,11 @@ class WebSocketTransport implements RpcTransport {
   constructor (webSocket: WebSocket) {
     this.#webSocket = webSocket;
 
+    // Deliver binary frames as ArrayBuffer (not Blob) so a binary codec (e.g.
+    // CBOR) can read them synchronously. Harmless for the default JSON codec,
+    // which uses text frames.
+    try { webSocket.binaryType = "arraybuffer"; } catch (_err) { /* not settable in some envs */ }
+
     if (webSocket.readyState === WebSocket.CONNECTING) {
       this.#sendQueue = [];
       webSocket.addEventListener("open", event => {
@@ -455,16 +460,22 @@ class WebSocketTransport implements RpcTransport {
     webSocket.addEventListener("message", (event: MessageEvent<any>) => {
       if (this.#error) {
         // Ignore further messages.
-      } else if (typeof event.data === "string") {
+      } else if (typeof event.data === "string"
+                 || event.data instanceof Uint8Array
+                 || event.data instanceof ArrayBuffer) {
+        // Strings carry the default JSON codec; binary frames carry a binary
+        // codec (e.g. CBOR). Normalize ArrayBuffer to Uint8Array.
+        let message: string | Uint8Array =
+            event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : event.data;
         if (this.#receiveResolver) {
-          this.#receiveResolver(event.data);
+          this.#receiveResolver(message);
           this.#receiveResolver = undefined;
           this.#receiveRejecter = undefined;
         } else {
-          this.#receiveQueue.push(event.data);
+          this.#receiveQueue.push(message);
         }
       } else {
-        this.#receivedError(new TypeError("Received non-string message from WebSocket."));
+        this.#receivedError(new TypeError("Received unsupported message type from WebSocket."));
       }
     });
 
@@ -478,13 +489,13 @@ class WebSocketTransport implements RpcTransport {
   }
 
   #webSocket: WebSocket;
-  #sendQueue?: string[];  // only if not opened yet
-  #receiveResolver?: (message: string) => void;
+  #sendQueue?: (string | Uint8Array)[];  // only if not opened yet
+  #receiveResolver?: (message: string | Uint8Array) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: string[] = [];
+  #receiveQueue: (string | Uint8Array)[] = [];
   #error?: any;
 
-  async send(message: string): Promise<void> {
+  async send(message: string | Uint8Array): Promise<void> {
     if (this.#sendQueue === undefined) {
       this.#webSocket.send(message);
     } else {
@@ -493,13 +504,13 @@ class WebSocketTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<string | Uint8Array> {
     if (this.#receiveQueue.length > 0) {
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
     } else {
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<string | Uint8Array>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });
@@ -539,13 +550,13 @@ class HibernatableWebSocketTransport implements RpcTransport {
       private onActivity?: () => void,
       private trace?: (event: HibernatableTransportTraceEvent) => void) {}
 
-  #sendQueue?: string[];
-  #receiveResolver?: (message: string) => void;
+  #sendQueue?: (string | Uint8Array)[];
+  #receiveResolver?: (message: string | Uint8Array) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: string[] = [];
+  #receiveQueue: (string | Uint8Array)[] = [];
   #error?: any;
 
-  async send(message: string): Promise<void> {
+  async send(message: string | Uint8Array): Promise<void> {
     if (this.#error) throw this.#error;
 
     this.trace?.({
@@ -589,13 +600,13 @@ class HibernatableWebSocketTransport implements RpcTransport {
     this.onActivity?.();
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<string | Uint8Array> {
     if (this.#receiveQueue.length > 0) {
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
     } else {
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<string | Uint8Array>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });
@@ -619,7 +630,7 @@ class HibernatableWebSocketTransport implements RpcTransport {
     this.#setError(reason);
   }
 
-  pushIncoming(message: string | ArrayBuffer): void {
+  pushIncoming(message: string | ArrayBuffer | Uint8Array): void {
     if (this.#error) return;
 
     this.trace?.({
@@ -631,17 +642,17 @@ class HibernatableWebSocketTransport implements RpcTransport {
       },
     });
 
-    if (typeof message !== "string") {
-      this.#setError(new TypeError("Received non-string message from hibernatable WebSocket."));
-      return;
-    }
+    // Strings carry the default JSON codec; binary frames carry a binary codec
+    // (e.g. CBOR). Normalize ArrayBuffer to Uint8Array.
+    let normalized: string | Uint8Array =
+        message instanceof ArrayBuffer ? new Uint8Array(message) : message;
 
     if (this.#receiveResolver) {
-      this.#receiveResolver(message);
+      this.#receiveResolver(normalized);
       this.#receiveResolver = undefined;
       this.#receiveRejecter = undefined;
     } else {
-      this.#receiveQueue.push(message);
+      this.#receiveQueue.push(normalized);
     }
     this.onActivity?.();
   }

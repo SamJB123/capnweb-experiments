@@ -6,7 +6,63 @@ import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeader, OutgoingHttpHeaders } from "node:http";
 
-type SendBatchFunc = (batch: string[]) => Promise<string[]>;
+type WireMessage = string | Uint8Array;
+type SendBatchFunc = (batch: WireMessage[]) => Promise<WireMessage[]>;
+
+// Content type used for binary-codec (e.g. CBOR) batches. The default JSON codec
+// uses newline-delimited text and sets no special content type, so the JSON wire
+// format is unchanged.
+const BINARY_CONTENT_TYPE = "application/octet-stream";
+
+/** True if the batch contains any binary message (i.e. a binary codec is in use). */
+function batchIsBinary(batch: WireMessage[]): boolean {
+  return batch.some(message => typeof message !== "string");
+}
+
+function toBytes(message: WireMessage): Uint8Array {
+  return typeof message === "string" ? new TextEncoder().encode(message) : message;
+}
+
+/**
+ * Pack multiple binary messages into one buffer using 4-byte big-endian
+ * length-prefix framing: [len][bytes][len][bytes]... A binary codec's bytes can
+ * contain any value (including 0x0A), so the JSON path's newline delimiter can't
+ * be reused.
+ */
+function encodeBinaryBatch(messages: WireMessage[]): Uint8Array {
+  const parts = messages.map(toBytes);
+  let total = 0;
+  for (const part of parts) total += 4 + part.length;
+
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  let offset = 0;
+  for (const part of parts) {
+    view.setUint32(offset, part.length, false);
+    offset += 4;
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function decodeBinaryBatch(data: Uint8Array): Uint8Array[] {
+  const messages: Uint8Array[] = [];
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 0;
+  while (offset < data.length) {
+    const length = view.getUint32(offset, false);
+    offset += 4;
+    messages.push(data.slice(offset, offset + length));
+    offset += length;
+  }
+  return messages;
+}
+
+function isBinaryContentType(contentType: string | null | undefined): boolean {
+  if (!contentType) return false;
+  return contentType.includes(BINARY_CONTENT_TYPE) || contentType.includes("cbor");
+}
 
 class BatchClientTransport implements RpcTransport {
   constructor(sendBatch: SendBatchFunc) {
@@ -16,10 +72,10 @@ class BatchClientTransport implements RpcTransport {
   #promise: Promise<void>;
   #aborted: any;
 
-  #batchToSend: string[] | null = [];
-  #batchToReceive: string[] | null = null;
+  #batchToSend: WireMessage[] | null = [];
+  #batchToReceive: WireMessage[] | null = null;
 
-  async send(message: string): Promise<void> {
+  async send(message: WireMessage): Promise<void> {
     // If the batch was already sent, we just ignore the message, because throwing may cause the
     // RPC system to abort prematurely. Once the last receive() is done then we'll throw an error
     // that aborts the RPC system at the right time and will propagate to all other requests.
@@ -28,7 +84,7 @@ class BatchClientTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<WireMessage> {
     if (!this.#batchToReceive) {
       await this.#promise;
     }
@@ -69,7 +125,26 @@ class BatchClientTransport implements RpcTransport {
 
 export function newHttpBatchRpcSession(
     urlOrRequest: string | Request, options?: RpcSessionOptions): RpcStub {
-  let sendBatch: SendBatchFunc = async (batch: string[]) => {
+  let sendBatch: SendBatchFunc = async (batch: WireMessage[]) => {
+    if (batchIsBinary(batch)) {
+      // Binary codec: length-prefixed framing over an octet-stream body. The
+      // server mirrors this mode, so the response is decoded the same way.
+      let response = await fetch(urlOrRequest, {
+        method: "POST",
+        headers: { "Content-Type": BINARY_CONTENT_TYPE },
+        body: encodeBinaryBatch(batch) as BodyInit,
+      });
+
+      if (!response.ok) {
+        response.body?.cancel();
+        throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);
+      }
+
+      let body = new Uint8Array(await response.arrayBuffer());
+      return body.byteLength === 0 ? [] : decodeBinaryBatch(body);
+    }
+
+    // Default JSON codec: newline-delimited text (unchanged wire format).
     let response = await fetch(urlOrRequest, {
       method: "POST",
       body: batch.join("\n"),
@@ -90,19 +165,19 @@ export function newHttpBatchRpcSession(
 }
 
 class BatchServerTransport implements RpcTransport {
-  constructor(batch: string[]) {
+  constructor(batch: WireMessage[]) {
     this.#batchToReceive = batch;
   }
 
-  #batchToSend: string[] = [];
-  #batchToReceive: string[];
+  #batchToSend: WireMessage[] = [];
+  #batchToReceive: WireMessage[];
   #allReceived: PromiseWithResolvers<void> = Promise.withResolvers<void>();
 
-  async send(message: string): Promise<void> {
+  async send(message: WireMessage): Promise<void> {
     this.#batchToSend.push(message);
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<WireMessage> {
     let msg = this.#batchToReceive!.shift();
     if (msg !== undefined) {
       return msg;
@@ -121,8 +196,14 @@ class BatchServerTransport implements RpcTransport {
     return this.#allReceived.promise;
   }
 
+  /** Newline-delimited text body for the default JSON codec. */
   getResponseBody(): string {
     return this.#batchToSend.join("\n");
+  }
+
+  /** Length-prefixed binary body for a binary codec (e.g. CBOR). */
+  getResponseBytes(): Uint8Array {
+    return encodeBinaryBatch(this.#batchToSend);
   }
 }
 
@@ -142,8 +223,16 @@ export async function newHttpBatchRpcResponse(
     return new Response("This endpoint only accepts POST requests.", { status: 405 });
   }
 
-  let body = await request.text();
-  let batch = body === "" ? [] : body.split("\n");
+  const binary = isBinaryContentType(request.headers.get("Content-Type"));
+
+  let batch: WireMessage[];
+  if (binary) {
+    let body = new Uint8Array(await request.arrayBuffer());
+    batch = body.byteLength === 0 ? [] : decodeBinaryBatch(body);
+  } else {
+    let body = await request.text();
+    batch = body === "" ? [] : body.split("\n");
+  }
 
   let transport = new BatchServerTransport(batch);
   let rpc = new RpcSession(transport, localMain, options);
@@ -160,6 +249,12 @@ export async function newHttpBatchRpcResponse(
 
   // TODO: Ask RpcSession to dispose everything it is still holding on to?
 
+  // Mirror the request's framing in the response so the client decodes it correctly.
+  if (binary) {
+    return new Response(transport.getResponseBytes() as BodyInit, {
+      headers: { "Content-Type": BINARY_CONTENT_TYPE },
+    });
+  }
   return new Response(transport.getResponseBody());
 }
 
@@ -181,17 +276,27 @@ export async function nodeHttpBatchRpcResponse(
     response.writeHead(405, "This endpoint only accepts POST requests.");
   }
 
-  let body = await new Promise<string>((resolve, reject) => {
+  const binary = isBinaryContentType(request.headers["content-type"]);
+
+  let bodyBuffer = await new Promise<Buffer>((resolve, reject) => {
     let chunks: Buffer[] = [];
     request.on("data", chunk => {
       chunks.push(chunk);
     });
     request.on("end", () => {
-      resolve(Buffer.concat(chunks).toString());
+      resolve(Buffer.concat(chunks));
     });
     request.on("error", reject);
   });
-  let batch = body === "" ? [] : body.split("\n");
+
+  let batch: WireMessage[];
+  if (binary) {
+    let body = new Uint8Array(bodyBuffer.buffer, bodyBuffer.byteOffset, bodyBuffer.byteLength);
+    batch = body.byteLength === 0 ? [] : decodeBinaryBatch(body);
+  } else {
+    let body = bodyBuffer.toString();
+    batch = body === "" ? [] : body.split("\n");
+  }
 
   let transport = new BatchServerTransport(batch);
   let rpc = new RpcSession(transport, localMain, options);
@@ -199,6 +304,14 @@ export async function nodeHttpBatchRpcResponse(
   await transport.whenAllReceived();
   await rpc.drain();
 
-  response.writeHead(200, options?.headers);
-  response.end(transport.getResponseBody());
+  // Mirror the request's framing in the response so the client decodes it correctly.
+  if (binary) {
+    const headers = { ...(options?.headers as OutgoingHttpHeaders | undefined), "Content-Type": BINARY_CONTENT_TYPE };
+    response.writeHead(200, headers);
+    const bytes = transport.getResponseBytes();
+    response.end(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+  } else {
+    response.writeHead(200, options?.headers);
+    response.end(transport.getResponseBody());
+  }
 }

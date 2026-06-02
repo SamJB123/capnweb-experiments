@@ -61,22 +61,22 @@ export class BunWebSocketTransport<T = undefined> implements RpcTransport {
   }
 
   #ws: ServerWebSocket<T>;
-  #receiveResolver?: (message: string) => void;
+  #receiveResolver?: (message: string | Uint8Array) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: string[] = [];
+  #receiveQueue: (string | Uint8Array)[] = [];
   #error?: any;
 
-  async send(message: string): Promise<void> {
+  async send(message: string | Uint8Array): Promise<void> {
     this.#ws.send(message);
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<string | Uint8Array> {
     if (this.#receiveQueue.length > 0) {
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
     } else {
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<string | Uint8Array>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });
@@ -98,19 +98,29 @@ export class BunWebSocketTransport<T = undefined> implements RpcTransport {
     }
   }
 
-  dispatchMessage(data: string | Buffer): void {
+  dispatchMessage(data: string | Buffer | ArrayBuffer | Uint8Array): void {
     if (this.#error) {
       return;
     }
 
-    let strData = typeof data === "string" ? data : data.toString("utf-8");
+    // Strings carry the default JSON codec; binary frames carry a binary codec
+    // (e.g. CBOR). Preserve bytes as Uint8Array rather than forcing UTF-8.
+    let message: string | Uint8Array;
+    if (typeof data === "string") {
+      message = data;
+    } else if (data instanceof ArrayBuffer) {
+      message = new Uint8Array(data);
+    } else {
+      // Node/Bun Buffer is a Uint8Array subclass; pass through as bytes.
+      message = data;
+    }
 
     if (this.#receiveResolver) {
-      this.#receiveResolver(strData);
+      this.#receiveResolver(message);
       this.#receiveResolver = undefined;
       this.#receiveRejecter = undefined;
     } else {
-      this.#receiveQueue.push(strData);
+      this.#receiveQueue.push(message);
     }
   }
 
