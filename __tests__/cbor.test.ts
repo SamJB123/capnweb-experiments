@@ -233,3 +233,91 @@ describe("codec state survives the session snapshot (mechanism)", () => {
     })).toThrow(/codec mismatch/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stateful CBOR codec (sequential mode): cross-message structure sharing, and
+// surviving hibernation by snapshotting the decoder structure table.
+// ---------------------------------------------------------------------------
+
+describe("stateful CBOR codec (sequential mode)", () => {
+  it("uses distinct ids for stateless vs stateful", () => {
+    expect(createCborCodec().id).toBe("cbor");
+    expect(createCborCodec({ stateful: true }).id).toBe("cbor-sequential");
+  });
+
+  it("makes calls end-to-end in sequential mode (repeated shapes included)", async () => {
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(serverTransport, new TestApi(), { codec: createCborCodec({ stateful: true }) });
+    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: createCborCodec({ stateful: true }) });
+    using stub = client.getRemoteMain();
+
+    expect(await stub.add(2, 3)).toBe(5);
+    expect(await stub.greet("world")).toBe("hello world");
+    // Repeated message shapes — exercises cross-message structure references.
+    expect(await stub.greet("mars")).toBe("hello mars");
+    expect(await stub.echo({ a: [1, 2, 3], b: "x" })).toEqual({ a: [1, 2, 3], b: "x" });
+    void server;
+  });
+
+  it("shares structures across messages (later messages are smaller)", () => {
+    const codec = createCborCodec({ stateful: true });
+    const m1 = ["push", 1, { method: "greet", args: ["world"] }];
+    const m2 = ["push", 2, { method: "greet", args: ["mars"] }];
+    const w1 = codec.encode(m1) as Uint8Array;
+    const w2 = codec.encode(m2) as Uint8Array;
+    expect(w2.byteLength).toBeLessThan(w1.byteLength);
+  });
+
+  it("a fresh stateful decoder cannot decode a mid-stream reference (so state matters)", () => {
+    const a = createCborCodec({ stateful: true });
+    const b = createCborCodec({ stateful: true });
+    const m1 = ["push", 1, { method: "greet", args: ["world"] }];
+    const m2 = ["push", 2, { method: "greet", args: ["mars"] }];
+    expect(b.decode(a.encode(m1))).toEqual(m1);
+    const w2 = a.encode(m2); // references the shape defined in m1, by id
+
+    const fresh = createCborCodec({ stateful: true });
+    let matched = false;
+    try { matched = JSON.stringify(fresh.decode(w2)) === JSON.stringify(m2); } catch { matched = false; }
+    expect(matched).toBe(false);
+  });
+
+  it("decoder structures survive snapshot/restore, staying in sync with a non-reset peer", () => {
+    const a = createCborCodec({ stateful: true }); // peer — never hibernates
+    const b = createCborCodec({ stateful: true }); // hibernates
+
+    const m1 = ["push", 1, { method: "greet", args: ["world"] }];
+    const m2 = ["push", 2, { method: "greet", args: ["mars"] }];
+    expect(b.decode(a.encode(m1))).toEqual(m1);
+    expect(b.decode(a.encode(m2))).toEqual(m2);
+
+    // B hibernates: snapshot its codec state, rebuild a fresh codec, restore.
+    const snap = b.snapshotState!();
+    const bResumed = createCborCodec({ stateful: true });
+    bResumed.restoreState!(snap);
+
+    // A (never reset) sends a definition-less reference to the shared shape.
+    const m3 = ["push", 3, { method: "greet", args: ["pluto"] }];
+    expect(bResumed.decode(a.encode(m3))).toEqual(m3);
+  });
+
+  it("a stateful session captures codec structures in its snapshot (4a + 4b)", async () => {
+    const serverCodec = createCborCodec({ stateful: true });
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
+    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: createCborCodec({ stateful: true }) });
+    using stub = client.getRemoteMain();
+    // Pass object-shaped args so cbor-x forms record structures (the protocol
+    // envelope itself is array-based and produces none). The server's decoder
+    // learns the {a,b} shape from these inbound call args.
+    await stub.echo({ a: 1, b: 2 });
+    await stub.echo({ a: 3, b: 4 });
+
+    const snap = server.__experimental_snapshot();
+    expect(snap.version).toBe(3);
+    expect(snap.codec?.id).toBe("cbor-sequential");
+    const structures = (snap.codec!.state as { decoderStructures: unknown[] }).decoderStructures;
+    expect(Array.isArray(structures)).toBe(true);
+    expect(structures.length).toBeGreaterThan(0); // learned the {a,b} object shape
+  });
+});
