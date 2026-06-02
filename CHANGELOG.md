@@ -1,5 +1,22 @@
 # capnweb
 
+## 0.8.0-hibernation-cbor.0
+
+Experimental prerelease published under the npm `experimental` dist-tag (not `latest`, which stays at `0.8.0-hibernation.0`). Adds an **optional CBOR wire codec** as an alternative to the default JSON wire format, to reduce bytes on the wire. Built on top of `0.8.0-hibernation.0`.
+
+### Added
+
+- **Pluggable wire codec.** `RpcSessionOptions` gains an optional `codec`. When omitted, the wire format is byte-identical to before (JSON). Both ends of a session must use the same codec.
+- **Optional CBOR codec** at the `capnweb/codec/cbor` subpath: `createCborCodec()`. `cbor-x` is an *optional* peer dependency — it is never bundled into the core and is only loaded if you import this subpath. Install it yourself to use CBOR.
+  - **Stateless (default):** each message is fully self-contained; hibernation-safe with no extra work.
+  - **Stateful (`{ stateful: true }`):** cbor-x "sequential" mode shares object-shape definitions across messages for smaller payloads. Its accumulated decoder state is carried through the hibernation snapshot, so it survives hibernation in sync with a non-hibernating peer (reusing the same mechanism that already keeps capabilities alive across hibernation).
+- `RpcSessionSnapshot` is now version 3 with an optional `codec` field; `__experimental_snapshot()` is surfaced on the public `RpcSession` interface. Stateless codecs continue to emit version-2 snapshots with no codec field.
+
+### Notes
+
+- The built-in transports (WebSocket, hibernatable WebSocket, MessagePort, Bun, HTTP batch) now carry `string | Uint8Array`; the JSON path is unchanged.
+- This build is unit/integration-tested but not yet exercised in a live runtime (real WebSocket / Durable Object hibernate-wake cycle). Treat as experimental.
+
 ## 0.8.0-hibernation.0
 
 Rebased the `capnweb-experimental-hibernation` fork onto upstream `capnweb` 0.8.0.
