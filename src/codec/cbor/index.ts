@@ -2,7 +2,12 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { Encoder, Decoder } from "cbor-x";
+// Use cbor-x's no-eval build: its eval build JIT-compiles record decoders with
+// `new Function(...)`, which throws "Code generation from strings disallowed" in
+// runtimes that ban dynamic code (Cloudflare Workers / workerd, strict CSP). The
+// no-eval build reads records with a generic loop instead — identical wire format
+// and features (useRecords/sequential/structures), only a slower decode path.
+import { Encoder, Decoder } from "cbor-x/index-no-eval";
 import type { Codec } from "../index.js";
 import { ensureProtocolTokenExtension, toProtocolTokens, fromProtocolTokens } from "./protocol-transform.js";
 

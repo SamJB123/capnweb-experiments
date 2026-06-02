@@ -2,7 +2,9 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { addExtension } from "cbor-x";
+// no-eval build — see the note in ./index.ts (avoids `new Function` codegen that
+// Cloudflare Workers / strict CSP disallow). Same API and wire format.
+import { addExtension } from "cbor-x/index-no-eval";
 
 /**
  * Optional "envelope optimization" for the CBOR codec.
