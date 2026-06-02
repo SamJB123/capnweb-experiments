@@ -321,3 +321,119 @@ describe("stateful CBOR codec (sequential mode)", () => {
     expect(structures.length).toBeGreaterThan(0); // learned the {a,b} object shape
   });
 });
+
+// ---------------------------------------------------------------------------
+// Envelope optimization: reshape string-headed protocol arrays into tagged maps
+// so cbor-x can share the tag/method keys. Must be a faithful bijection that
+// NEVER lets user data be decoded as a protocol token.
+// ---------------------------------------------------------------------------
+
+describe("envelope optimization (array→object via private CBOR tag)", () => {
+  const mk = () => createCborCodec({ stateful: true, optimizeEnvelope: true });
+
+  it("uses a distinct id so the snapshot guard catches a mismatch", () => {
+    expect(mk().id).toBe("cbor-sequential-proto");
+    expect(createCborCodec({ optimizeEnvelope: true }).id).toBe("cbor-proto");
+  });
+
+  // --- faithful bijection across representative protocol shapes ---
+  const cases: Record<string, unknown> = {
+    "push w/ pipeline + bytes": ["push", 1, ["pipeline", -3, ["setPose"], [["bytes", "Kv0AAPYDfwA"]]]],
+    "release": ["release", 5, 1],
+    "resolve w/ object arg": ["resolve", -2, { a: 1, b: [2, 3] }],
+    "numeric path element": ["pipeline", 3, [0, "x"], [[1, 2, 3]]],
+    "error w/ own props": ["push", 1, ["error", "TypeError", "boom", null, { code: 5 }]],
+    "undefined token": ["push", 1, ["undefined"]],
+    "empty + nested arrays": ["push", 7, [[]]],
+    "headers-like (string-keyed pairs)": ["resolve", -1, ["headers", [["x-a", "1"], ["x-b", "2"]]]],
+  };
+  for (const [name, msg] of Object.entries(cases)) {
+    it(`round-trips ${name}`, () => {
+      const c = mk();
+      expect(c.decode(c.encode(msg))).toEqual(msg);
+    });
+  }
+
+  // --- SECURITY: user data shaped like tokens must never decode as a token ---
+  describe("does not let user data bleed into the protocol envelope", () => {
+    it("a user object whose keys look like tags stays an object", () => {
+      const c = mk();
+      const msg = ["push", 1, { push: [99], pipeline: [1, 2], export: [5] }];
+      const back = c.decode(c.encode(msg)) as unknown[];
+      expect(back).toEqual(msg);
+      expect(Array.isArray(back[2])).toBe(false); // still an object, not ["push",99,…]
+      expect(back[2]).toEqual({ push: [99], pipeline: [1, 2], export: [5] });
+    });
+
+    it("deeply nested token-shaped user objects stay objects", () => {
+      const c = mk();
+      const msg = ["resolve", -1, { a: { pipeline: { export: [1] } }, b: [{ push: [2] }] }];
+      const back = c.decode(c.encode(msg)) as unknown[];
+      expect(back).toEqual(msg);
+      expect(Array.isArray((back[2] as any).a)).toBe(false);
+      expect(Array.isArray((back[2] as any).a.pipeline)).toBe(false);
+    });
+
+    it("an escaped user array of strings round-trips exactly (never a token)", () => {
+      const c = mk();
+      // [["pipeline","evil"]] is capnweb's escape of the USER array ["pipeline","evil"].
+      const msg = ["push", 1, [["pipeline", "evil"]]];
+      const back = c.decode(c.encode(msg)) as unknown[];
+      expect(back).toEqual(msg);
+      // The arg is the escaped wrapper (array of one array), not a token.
+      expect(Array.isArray(back[2])).toBe(true);
+      expect(back[2]).toEqual([["pipeline", "evil"]]);
+    });
+
+    it("a bare user object identical to a token shape decodes to an object", () => {
+      const c = mk();
+      const userObj = { export: [1, 2, 3] };
+      const back = c.decode(c.encode(["resolve", -1, userObj])) as unknown[];
+      expect(back[2]).toEqual(userObj);
+      expect(Array.isArray(back[2])).toBe(false);
+    });
+  });
+
+  // --- the actual win: shared tag keys make warm messages smaller ---
+  it("after warmup, optimized messages are smaller than the plain sequential form", () => {
+    const plain = createCborCodec({ stateful: true });
+    const opt = createCborCodec({ stateful: true, optimizeEnvelope: true });
+    let plainSize = 0;
+    let optSize = 0;
+    for (let i = 0; i < 6; i++) {
+      const m = ["push", i, ["pipeline", -3, ["setPose"], [["bytes", "Kv0AAPYDfwA"]]]];
+      plainSize = (plain.encode(m) as Uint8Array).byteLength;
+      optSize = (opt.encode(m) as Uint8Array).byteLength;
+    }
+    expect(optSize).toBeLessThan(plainSize);
+  });
+
+  // --- end-to-end over a real session, including a token-shaped object arg ---
+  it("works end-to-end over an RPC session", async () => {
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(serverTransport, new TestApi(), { codec: mk() });
+    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: mk() });
+    using stub = client.getRemoteMain();
+
+    expect(await stub.add(2, 3)).toBe(5);
+    expect(await stub.greet("world")).toBe("hello world");
+    // A token-shaped object argument must survive as an object end-to-end.
+    expect(await stub.echo({ push: [1], pipeline: [2] })).toEqual({ push: [1], pipeline: [2] });
+    void server;
+  });
+
+  // --- composes with the hibernation snapshot mechanism ---
+  it("snapshots codec state with envelope optimization (id reflects the mode)", async () => {
+    const serverCodec = mk();
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
+    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: mk() });
+    using stub = client.getRemoteMain();
+    await stub.echo({ a: 1, b: 2 });
+
+    const snap = server.__experimental_snapshot();
+    expect(snap.version).toBe(3);
+    expect(snap.codec?.id).toBe("cbor-sequential-proto");
+    void server;
+  });
+});

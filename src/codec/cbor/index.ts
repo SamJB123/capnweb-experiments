@@ -4,6 +4,7 @@
 
 import { Encoder, Decoder } from "cbor-x";
 import type { Codec } from "../index.js";
+import { ensureProtocolTokenExtension, toProtocolTokens } from "./protocol-transform.js";
 
 /** Options for {@link createCborCodec}. */
 export interface CborCodecOptions {
@@ -20,6 +21,19 @@ export interface CborCodecOptions {
    * Default `false` — stateless, each message fully self-contained.
    */
   stateful?: boolean;
+
+  /**
+   * Reshape capnweb's tagged-array protocol envelope into objects so cbor-x can
+   * structure-share the repeated tag/method strings (`"push"`, `"pipeline"`,
+   * `"setPose"`, …) — see {@link toProtocolTokens}. The reshape is a provably
+   * injective bijection carried under a private CBOR tag, so user data can never
+   * be confused for a protocol token.
+   *
+   * Only worthwhile together with `stateful: true` (the sharing it enables lives
+   * in the sequential structure table). With a stateless codec it just adds tag
+   * overhead. Default `false`.
+   */
+  optimizeEnvelope?: boolean;
 }
 
 function decodeGuard(wire: string | Uint8Array): Uint8Array {
@@ -88,14 +102,23 @@ function decodeGuard(wire: string | Uint8Array): Uint8Array {
  * object-heavy user payloads.
  */
 export function createCborCodec(options: CborCodecOptions = {}): Codec {
+  // Envelope optimization: reshape string-headed protocol arrays into tagged maps
+  // on encode so cbor-x can share the tag/method keys. Decode needs no companion
+  // step — the tag extension reconstructs the arrays inline. `prep` is identity
+  // when disabled, keeping the JSON-equivalent shape.
+  const optimize = !!options.optimizeEnvelope;
+  if (optimize) ensureProtocolTokenExtension();
+  const prep = optimize ? toProtocolTokens : (m: unknown) => m;
+  const protoSuffix = optimize ? "-proto" : "";
+
   if (!options.stateful) {
     // Stateless: a single Encoder instance both encodes and decodes; no shared
     // structure table, so each message stands alone.
     const encoder = new Encoder({ useRecords: false });
     return {
-      id: "cbor",
+      id: "cbor" + protoSuffix,
       encode(message: unknown): Uint8Array {
-        return encoder.encode(message);
+        return encoder.encode(prep(message));
       },
       decode(wire: string | Uint8Array): unknown {
         return encoder.decode(decodeGuard(wire));
@@ -112,10 +135,10 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
   let decoder = new Decoder({ ...SEQ, structures: decoderStructures });
 
   return {
-    id: "cbor-sequential",
+    id: "cbor-sequential" + protoSuffix,
 
     encode(message: unknown): Uint8Array {
-      return encoder.encode(message);
+      return encoder.encode(prep(message));
     },
 
     decode(wire: string | Uint8Array): unknown {
