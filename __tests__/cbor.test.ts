@@ -3,6 +3,7 @@
 //     https://opensource.org/license/mit
 
 import { expect, it, describe } from "vitest";
+import { Encoder, Tag } from "cbor-x";
 import { RpcSession, RpcTarget, type RpcTransport } from "../src/index.js";
 import { createCborCodec } from "../src/codec/cbor/index.js";
 import type { Codec } from "../src/codec/index.js";
@@ -435,5 +436,210 @@ describe("envelope optimization (array→object via private CBOR tag)", () => {
     expect(snap.version).toBe(3);
     expect(snap.codec?.id).toBe("cbor-sequential-proto");
     void server;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADVERSARIAL SECURITY SUITE for the envelope optimization.
+//
+// Threat model: the transform must never let user-supplied data be decoded as a
+// protocol token (capability ref, message type, pipeline path, …), and a hostile
+// PEER must not be able to use the codec to manufacture a token shape it couldn't
+// already send over plain JSON. The two properties:
+//   (1) Faithful injective bijection: user data shaped like tokens round-trips as
+//       data (objects stay objects, escaped arrays stay escaped), never as tokens.
+//   (2) Forged tags fail loudly: a hostile frame that wraps the private tag around
+//       anything our encoder would never emit is rejected, not turned into a token.
+// ---------------------------------------------------------------------------
+
+describe("envelope optimization — adversarial security", () => {
+  const mk = () => createCborCodec({ stateful: true, optimizeEnvelope: true });
+  const PROTO_TAG = 13;
+
+  // Forge a hostile wire frame: the private protocol-token tag wrapped around
+  // arbitrary content our own encoder would never produce.
+  const forgeTag = (content: unknown): Uint8Array =>
+    new Encoder({ useRecords: true, sequential: true }).encode(new Tag(content, PROTO_TAG));
+
+  const roundTrips = (msg: unknown) => {
+    const c = mk();
+    return c.decode(c.encode(msg));
+  };
+
+  // ---- (1) Faithfulness: user data shaped like tokens must stay data ----------
+
+  it("01: user object shaped like a 'push' token stays an object", () => {
+    const msg = ["resolve", -1, { push: [99] }];
+    const back = roundTrips(msg) as unknown[];
+    expect(back).toEqual(msg);
+    expect(Array.isArray(back[2])).toBe(false);
+  });
+
+  it("02: a capability-ref-shaped user object {export:[0]} does NOT become a token", () => {
+    // export 0 is the bootstrap/main capability — the worst thing to forge.
+    const msg = ["resolve", -1, { export: [0] }];
+    const back = roundTrips(msg) as unknown[];
+    expect(back[2]).toEqual({ export: [0] });
+    expect(Array.isArray(back[2])).toBe(false); // an object, not ["export",0]
+  });
+
+  it("03: user object {import:[5]} stays an object", () => {
+    const back = roundTrips(["resolve", -1, { import: [5] }]) as unknown[];
+    expect(Array.isArray(back[2])).toBe(false);
+    expect(back[2]).toEqual({ import: [5] });
+  });
+
+  it("04: user object {pipeline:[3,['method'],[[1]]]} stays an object", () => {
+    const arg = { pipeline: [3, ["method"], [[1]]] };
+    const back = roundTrips(["push", 1, arg]) as unknown[];
+    expect(Array.isArray(back[2])).toBe(false);
+    expect(back[2]).toEqual(arg);
+  });
+
+  it("05: user object {release:[7,1]} stays an object", () => {
+    const back = roundTrips(["push", 1, { release: [7, 1] }]) as unknown[];
+    expect(Array.isArray(back[2])).toBe(false);
+  });
+
+  it("06: user object {abort:['boom']} stays an object", () => {
+    const back = roundTrips(["push", 1, { abort: ["boom"] }]) as unknown[];
+    expect(Array.isArray(back[2])).toBe(false);
+    expect(back[2]).toEqual({ abort: ["boom"] });
+  });
+
+  it("07: deeply nested token-shaped user objects all stay objects", () => {
+    const msg = ["resolve", -1, { a: { pipeline: { export: [0] } }, b: [{ push: [1] }] }];
+    const back = roundTrips(msg) as any[];
+    expect(back).toEqual(msg);
+    expect(Array.isArray(back[2].a)).toBe(false);
+    expect(Array.isArray(back[2].a.pipeline)).toBe(false);
+    expect(Array.isArray(back[2].a.pipeline.export)).toBe(true); // [0] genuinely an array
+    expect(Array.isArray(back[2].b[0])).toBe(false);
+  });
+
+  it("08: an escaped user array [['export',0]] round-trips as an escaped array", () => {
+    // capnweb escapes the USER array ["export",0] to [["export",0]]; it must come
+    // back as the escape wrapper (so capnweb un-escapes it to user data), NOT a cap.
+    const msg = ["push", 1, [["export", 0]]];
+    const back = roundTrips(msg) as unknown[];
+    expect(back).toEqual(msg);
+    expect(Array.isArray(back[2])).toBe(true);
+    expect(back[2]).toEqual([["export", 0]]);
+  });
+
+  it("09: an escaped user array full of tag-name strings round-trips exactly", () => {
+    const msg = ["push", 1, [["push", "pull", "resolve", "reject", "release", "abort"]]];
+    expect(roundTrips(msg)).toEqual(msg);
+  });
+
+  it("10: a user string equal to a tag name stays a primitive string", () => {
+    const back = roundTrips(["resolve", -1, "export"]) as unknown[];
+    expect(back[2]).toBe("export");
+    expect(typeof back[2]).toBe("string");
+  });
+
+  it("11: a multi-key user object with tag-named keys stays an object", () => {
+    const arg = { push: [1], export: [2], pipeline: [3], release: [4] };
+    const back = roundTrips(["push", 1, arg]) as unknown[];
+    expect(Array.isArray(back[2])).toBe(false);
+    expect(back[2]).toEqual(arg);
+  });
+
+  it("12: a hostile '__proto__' key neither pollutes Object.prototype nor crashes", () => {
+    const evil = JSON.parse('{"__proto__":{"polluted":true},"normal":1}');
+    const c = mk();
+    expect(() => c.decode(c.encode(["resolve", -1, evil]))).not.toThrow();
+    expect(({} as any).polluted).toBeUndefined();
+    expect(([] as any).polluted).toBeUndefined();
+  });
+
+  it("13: a 'constructor'-keyed user object does not pollute and stays an object", () => {
+    const evil = JSON.parse('{"constructor":{"x":1}}');
+    const back = roundTrips(["resolve", -1, evil]) as unknown[];
+    expect(({} as any).x).toBeUndefined();
+    expect(Array.isArray(back[2])).toBe(false);
+  });
+
+  // ---- (2) Forged tags from a hostile peer must be rejected, not promoted ------
+
+  it("14: forged tag wrapping a non-array arg value is rejected", () => {
+    expect(() => mk().decode(forgeTag({ push: 5 }))).toThrow();
+  });
+
+  it("15: forged tag wrapping a bare array (not a map) is rejected", () => {
+    expect(() => mk().decode(forgeTag([1, 2, 3]))).toThrow();
+  });
+
+  it("16: forged tag wrapping a string is rejected", () => {
+    expect(() => mk().decode(forgeTag("export"))).toThrow();
+  });
+
+  it("17: forged tag wrapping a number is rejected", () => {
+    expect(() => mk().decode(forgeTag(42))).toThrow();
+  });
+
+  it("18: forged tag wrapping an empty map is rejected", () => {
+    expect(() => mk().decode(forgeTag({}))).toThrow();
+  });
+
+  it("19: forged tag wrapping a multi-key map is rejected (no key-smuggling)", () => {
+    expect(() => mk().decode(forgeTag({ export: [0], push: [1] }))).toThrow();
+  });
+
+  it("20: forged tag wrapping null is rejected", () => {
+    expect(() => mk().decode(forgeTag(null))).toThrow();
+  });
+
+  it("21: forged tag wrapping a boolean is rejected", () => {
+    expect(() => mk().decode(forgeTag(true))).toThrow();
+  });
+
+  it("22: forged tag wrapping a nested forged tag (tag-in-tag) is rejected", () => {
+    expect(() => mk().decode(forgeTag(new Tag({ push: [1] }, PROTO_TAG)))).toThrow();
+  });
+
+  // ---- (3) Transparency: a well-formed token is reconstructed faithfully, and
+  //          capnweb's Evaluator (not our codec) remains the capability gate ------
+
+  it("23: a well-formed forged token decodes to exactly the array a JSON peer would send", () => {
+    // No escalation: our layer faithfully yields ["export",0]; capnweb's Evaluator
+    // then validates it against the export table exactly as for a JSON ["export",0].
+    expect(mk().decode(forgeTag({ export: [0] }))).toEqual(["export", 0]);
+    expect(mk().decode(forgeTag({ pipeline: [5, ["m"], [[1]]] }))).toEqual(["pipeline", 5, ["m"], [[1]]]);
+  });
+
+  // ---- (4) Structural edge cases that could silently corrupt the bijection -----
+
+  it("24: empty array round-trips as an empty array (not a token)", () => {
+    expect(roundTrips(["push", 1, [[]]])).toEqual(["push", 1, [[]]]);
+  });
+
+  it("25: a number-headed array stays a plain array (not tokenized)", () => {
+    const msg = ["pipeline", 3, [0, "x"], [[1, 2]]];
+    expect(roundTrips(msg)).toEqual(msg);
+  });
+
+  it("26: an empty-string token head round-trips faithfully", () => {
+    expect(roundTrips(["", 1, 2])).toEqual(["", 1, 2]);
+  });
+
+  it("27: nulls, false, 0 and '' in token and data positions round-trip", () => {
+    const msg = ["resolve", -1, { a: null, b: false, c: 0, d: "", e: [null, 0, false, ""] }];
+    expect(roundTrips(msg)).toEqual(msg);
+  });
+
+  it("28: a battery of token-shaped and user-shaped siblings all round-trip and keep their kind", () => {
+    const battery: unknown[] = [
+      ["push", 1, ["pipeline", -3, ["setPose"], [["bytes", "AAAA"]]]],
+      ["resolve", -1, { export: [0], nested: { import: [1] } }],
+      ["release", 5, 1],
+      ["push", 2, [["export", 0]]],            // escaped user array
+      ["push", 3, [[0, 1, 2]]],                 // escaped numeric user array
+      ["resolve", -2, "pipeline"],              // user string == tag name
+    ];
+    for (const msg of battery) {
+      // Equivalent to what JSON would faithfully preserve — proves no aliasing.
+      expect(roundTrips(msg)).toEqual(JSON.parse(JSON.stringify(msg)));
+    }
   });
 });

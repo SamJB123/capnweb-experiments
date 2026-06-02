@@ -65,30 +65,48 @@ let registered = false;
 export function ensureProtocolTokenExtension(): void {
   if (registered) return;
   registered = true;
-  addExtension({
+  // Typed via cbor-x's own generic (T = the wrapped class, R = the encoded
+  // representation). R is `unknown` because `decode` receives whatever a (possibly
+  // hostile) peer put under the tag and validates it at runtime.
+  addExtension<ProtocolToken, unknown>({
     Class: ProtocolToken,
     tag: PROTOCOL_TOKEN_TAG,
-    encode(token: ProtocolToken, encode: (data: unknown) => Uint8Array): Uint8Array {
+    encode(token, encode) {
       // One-key map keyed by the head string → cbor-x record-shares the key set
       // (so "push"/"pipeline"/"setPose" become a structure id after first use).
       return encode({ [token.head]: token.rest });
     },
-    // Inner values are decoded bottom-up (nested tokens are already arrays by now),
-    // so we can rebuild the original [head, ...rest] array directly. Returning an
-    // array rather than a ProtocolToken means no decode-side walk is needed.
-    decode(map: Record<string, unknown>): unknown {
-      const head = Object.keys(map)[0];
-      return [head, ...(map[head] as unknown[])];
+    decode(item): ProtocolToken {
+      // Our own encoder only ever emits a single-key map whose value is an array.
+      // A hostile peer could forge the tag around anything else; validate strictly
+      // so such frames throw (the session aborts) rather than manufacturing a bogus
+      // token. This never weakens capnweb's Evaluator validation downstream.
+      if (item === null || typeof item !== "object" || Array.isArray(item)) {
+        throw new TypeError("capnweb CBOR: protocol-token tag must wrap an object");
+      }
+      // `item` is now narrowed to a non-array object; the index-signature cast is
+      // the standard way to read string keys off it after that runtime check.
+      const map = item as Record<string, unknown>;
+      const keys = Object.keys(map);
+      if (keys.length !== 1) {
+        throw new TypeError(
+          `capnweb CBOR: protocol-token map must have exactly one key (got ${keys.length})`);
+      }
+      const head = keys[0];
+      const rest = map[head];
+      if (!Array.isArray(rest)) {
+        throw new TypeError("capnweb CBOR: protocol-token args must be an array");
+      }
+      return new ProtocolToken(head, rest);
     },
-  } as unknown as Parameters<typeof addExtension>[0]);
+  });
 }
 
 /**
  * Encode-side walk: replace every string-headed array with a {@link ProtocolToken}
  * (which the extension writes under the private tag). Objects, primitives, and
  * arrays whose head is not a string are recursed into but kept structurally as-is.
- *
- * Decoding needs no companion walk — the tag extension reconstructs arrays inline.
+ * {@link fromProtocolTokens} is its exact inverse on decode.
  */
 export function toProtocolTokens(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -102,9 +120,53 @@ export function toProtocolTokens(value: unknown): unknown {
     return value.map(toProtocolTokens);
   }
   if (value !== null && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
     const out: Record<string, unknown> = {};
-    for (const key in value as Record<string, unknown>) {
-      out[key] = toProtocolTokens((value as Record<string, unknown>)[key]);
+    for (const key of Object.keys(obj)) {
+      const transformed = toProtocolTokens(obj[key]);
+      // Assigning `out["__proto__"] = …` would trip the prototype setter; define it
+      // as a plain own property so a hostile "__proto__" key can neither pollute
+      // nor be silently dropped. (capnweb's Evaluator independently strips such
+      // keys on the receive side.)
+      if (key === "__proto__") {
+        Object.defineProperty(out, key, {
+          value: transformed, enumerable: true, writable: true, configurable: true,
+        });
+      } else {
+        out[key] = transformed;
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Decode-side walk: the exact inverse of {@link toProtocolTokens}. The tag
+ * extension hands back {@link ProtocolToken} instances (bottom-up, so a token's
+ * `rest` may itself contain tokens); rebuild each as its `[head, ...rest]` array.
+ * Objects and non-token arrays are recursed into but kept structurally as-is.
+ */
+export function fromProtocolTokens(value: unknown): unknown {
+  if (value instanceof ProtocolToken) {
+    return [value.head, ...value.rest.map(fromProtocolTokens)];
+  }
+  if (Array.isArray(value)) {
+    return value.map(fromProtocolTokens);
+  }
+  if (value !== null && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(obj)) {
+      const restored = fromProtocolTokens(obj[key]);
+      // Same prototype-pollution guard as the encode side (see toProtocolTokens).
+      if (key === "__proto__") {
+        Object.defineProperty(out, key, {
+          value: restored, enumerable: true, writable: true, configurable: true,
+        });
+      } else {
+        out[key] = restored;
+      }
     }
     return out;
   }

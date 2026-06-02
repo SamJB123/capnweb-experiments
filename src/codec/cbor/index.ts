@@ -4,7 +4,7 @@
 
 import { Encoder, Decoder } from "cbor-x";
 import type { Codec } from "../index.js";
-import { ensureProtocolTokenExtension, toProtocolTokens } from "./protocol-transform.js";
+import { ensureProtocolTokenExtension, toProtocolTokens, fromProtocolTokens } from "./protocol-transform.js";
 
 /** Options for {@link createCborCodec}. */
 export interface CborCodecOptions {
@@ -109,6 +109,7 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
   const optimize = !!options.optimizeEnvelope;
   if (optimize) ensureProtocolTokenExtension();
   const prep = optimize ? toProtocolTokens : (m: unknown) => m;
+  const post = optimize ? fromProtocolTokens : (m: unknown) => m;
   const protoSuffix = optimize ? "-proto" : "";
 
   if (!options.stateful) {
@@ -121,7 +122,7 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
         return encoder.encode(prep(message));
       },
       decode(wire: string | Uint8Array): unknown {
-        return encoder.decode(decodeGuard(wire));
+        return post(encoder.decode(decodeGuard(wire)));
       },
     };
   }
@@ -142,7 +143,7 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
     },
 
     decode(wire: string | Uint8Array): unknown {
-      return decoder.decode(decodeGuard(wire));
+      return post(decoder.decode(decodeGuard(wire)));
     },
 
     snapshotState() {
