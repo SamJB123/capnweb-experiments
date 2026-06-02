@@ -100,6 +100,13 @@ export interface RpcSession<T extends RpcCompatible<T> = undefined> {
   // Waits until the peer is not waiting on any more promise resolutions from us. This is useful
   // in particular to decide when a batch is complete.
   drain(): Promise<void>;
+
+  /**
+   * EXPERIMENTAL: Capture a snapshot of this session's state (export/import tables, and any
+   * stateful wire-codec state) so the session can be restored after hibernation. Pair with
+   * `RpcSessionOptions.__experimental_restoreSnapshot`.
+   */
+  __experimental_snapshot(): RpcSessionSnapshot;
 }
 export const RpcSession: {
   new <T extends RpcCompatible<T> = undefined>(

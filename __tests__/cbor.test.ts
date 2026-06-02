@@ -5,6 +5,7 @@
 import { expect, it, describe } from "vitest";
 import { RpcSession, RpcTarget, type RpcTransport } from "../src/index.js";
 import { createCborCodec } from "../src/codec/cbor/index.js";
+import type { Codec } from "../src/codec/index.js";
 
 // ---------------------------------------------------------------------------
 // Codec-level round-trip: encode then decode must reproduce the devalued message.
@@ -143,5 +144,92 @@ describe("CBOR codec over an RPC session", () => {
     expect(await api.add(40, 2)).toBe(42);
 
     void server;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mechanism: a stateful codec's state rides the session snapshot and is restored
+// on resume. This is codec-agnostic — proven here with a controlled test codec.
+// ---------------------------------------------------------------------------
+
+/** JSON passthrough plus observable, snapshottable state (count of encodes). */
+class CountingCodec implements Codec {
+  readonly id = "counting";
+  encodeCount = 0;
+  restoredWith: unknown = undefined;
+
+  encode(message: unknown): string {
+    this.encodeCount++;
+    return JSON.stringify(message);
+  }
+  decode(wire: string | Uint8Array): unknown {
+    return JSON.parse(typeof wire === "string" ? wire : new TextDecoder().decode(wire));
+  }
+  snapshotState() {
+    return { encodeCount: this.encodeCount };
+  }
+  restoreState(state: unknown) {
+    this.restoredWith = state;
+    this.encodeCount = (state as { encodeCount: number }).encodeCount;
+  }
+}
+
+describe("codec state survives the session snapshot (mechanism)", () => {
+  it("captures stateful codec state at version 3 and restores it on a new session", async () => {
+    const serverCodec = new CountingCodec();
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
+    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: new CountingCodec() });
+    using stub = client.getRemoteMain();
+
+    // Drive some traffic so the server codec accumulates state.
+    expect(await stub.add(2, 3)).toBe(5);
+    expect(serverCodec.encodeCount).toBeGreaterThan(0);
+
+    const snap = server.__experimental_snapshot();
+    expect(snap.version).toBe(3);
+    expect(snap.codec?.id).toBe("counting");
+    expect((snap.codec?.state as { encodeCount: number }).encodeCount).toBe(serverCodec.encodeCount);
+
+    // Simulate hibernation: rebuild the server from the snapshot with a fresh codec instance.
+    const resumedCodec = new CountingCodec();
+    const [, serverTransport2] = makePair();
+    const resumed = new RpcSession(serverTransport2, new TestApi(), {
+      codec: resumedCodec,
+      __experimental_restoreSnapshot: snap,
+    });
+
+    // The fresh codec was rehydrated from the snapshot before the read loop ran.
+    expect(resumedCodec.restoredWith).toEqual(snap.codec?.state);
+    expect(resumedCodec.encodeCount).toBe(serverCodec.encodeCount);
+    void resumed;
+  });
+
+  it("omits codec state (stays version 2) for a stateless codec", async () => {
+    const [clientTransport, serverTransport] = makePair();
+    // Default JSON codec has no snapshotState.
+    const server = new RpcSession(serverTransport, new TestApi());
+    const client = new RpcSession<TestApi>(clientTransport);
+    using stub = client.getRemoteMain();
+    expect(await stub.add(1, 1)).toBe(2);
+
+    const snap = server.__experimental_snapshot();
+    expect(snap.version).toBe(2);
+    expect(snap.codec).toBeUndefined();
+  });
+
+  it("rejects restoring codec state into a session with a different codec", () => {
+    const [, serverTransport] = makePair();
+    const snap = {
+      version: 3 as const,
+      nextExportId: -1,
+      exports: [],
+      codec: { id: "counting", state: { encodeCount: 5 } },
+    };
+    // Resume with a DIFFERENT codec id -> must throw.
+    expect(() => new RpcSession(serverTransport, new TestApi(), {
+      codec: createCborCodec(),
+      __experimental_restoreSnapshot: snap,
+    })).toThrow(/codec mismatch/);
   });
 });

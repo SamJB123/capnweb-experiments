@@ -797,12 +797,20 @@ class RpcSessionImpl implements Importer, Exporter {
       });
     }
 
+    // Capture stateful wire-codec state (e.g. CBOR structure tables) so it
+    // survives hibernation in sync with the peer. Stateless codecs (the JSON
+    // default) omit `snapshotState`, leaving the snapshot at version 2.
+    const codec = this.codec.snapshotState
+      ? { id: this.codec.id, state: this.codec.snapshotState() }
+      : undefined;
+
     return {
-      version: 2,
+      version: codec ? 3 : 2,
       nextExportId: this.nextExportId,
       exports,
       ...(imports.length > 0 ? {imports} : {}),
       ...(this.importReplays.length > 0 ? { importReplays: this.importReplays } : {}),
+      ...(codec ? { codec } : {}),
     };
   }
 
@@ -1327,8 +1335,22 @@ class RpcSessionImpl implements Importer, Exporter {
   }
 
   private restoreFromSnapshot(snapshot: RpcSessionSnapshot) {
-    if (snapshot.version !== 1 && snapshot.version !== 2) {
+    if (snapshot.version !== 1 && snapshot.version !== 2 && snapshot.version !== 3) {
       throw new Error(`Unsupported RPC session snapshot version: ${snapshot.version}`);
+    }
+
+    // Restore stateful wire-codec state first, before the read loop decodes any
+    // message. The codec id must match, or the restored state is meaningless.
+    if (snapshot.codec) {
+      if (snapshot.codec.id !== this.codec.id) {
+        throw new Error(
+          `Snapshot codec mismatch: snapshot was made with codec "${snapshot.codec.id}" ` +
+          `but this session uses codec "${this.codec.id}".`);
+      }
+      if (this.codec.restoreState) {
+        this.codec.restoreState(snapshot.codec.state);
+      }
+      this.trace("restoreFromSnapshot.codec", { id: snapshot.codec.id });
     }
 
     this.nextExportId = snapshot.nextExportId;

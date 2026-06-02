@@ -34,8 +34,20 @@ export type RpcSessionSnapshotImport = {
   remoteRefcount: number;
 };
 
+/**
+ * Wire-codec state carried inside the session snapshot so a stateful codec (e.g.
+ * a CBOR codec sharing structure definitions across messages) can survive
+ * hibernation in sync with the peer. `state` is whatever the codec's
+ * `snapshotState()` returns and must be JSON-serializable. `id` guards against
+ * restoring codec state into a session configured with a different codec.
+ */
+export type RpcSessionCodecState = {
+  id: string;
+  state: unknown;
+};
+
 export type RpcSessionSnapshot = {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   nextExportId: number;
   exports: RpcSessionSnapshotExport[];
   /** Peer-imported capabilities (stubs pointing back to the peer's exports).
@@ -46,6 +58,9 @@ export type RpcSessionSnapshot = {
    *  application state. Replaying these after restore rebuilds app-held
    *  references without requiring application-layer persistence. */
   importReplays?: RpcSessionExportProvenance[];
+  /** Stateful wire-codec state (version 3+). Present only when the session's
+   *  codec implements `snapshotState()`. The default JSON codec omits this. */
+  codec?: RpcSessionCodecState;
 };
 
 export type HibernatableSnapshotStorageMode = "inline" | "sessionStore";
