@@ -22,6 +22,7 @@ import type {
   RpcSessionExportProvenance,
   RpcSessionSnapshot,
 } from "./hibernation.js";
+import { type Codec, jsonCodec } from "./codec/index.js";
 
 /**
  * Interface for an RPC transport, which is a simple bidirectional message stream. Implement this
@@ -30,8 +31,12 @@ import type {
 export interface RpcTransport {
   /**
    * Sends a message to the other end.
+   *
+   * Messages are `string` for the default JSON codec. A transport may also
+   * receive `Uint8Array` when a binary codec (e.g. CBOR) is in use; transports
+   * that only support text may treat that as unsupported.
    */
-  send(message: string): Promise<void>;
+  send(message: string | Uint8Array): Promise<void>;
 
   /**
    * Receives a message sent by the other end.
@@ -41,7 +46,7 @@ export interface RpcTransport {
    * If there are no outstanding calls (and none are made in the future), then the error does not
    * propagate anywhere -- this is considered a "clean" shutdown.
    */
-  receive(): Promise<string>;
+  receive(): Promise<string | Uint8Array>;
 
   /**
    * Indicates that the RPC system has suffered an error that prevents the session from continuing.
@@ -376,6 +381,13 @@ export type RpcSessionOptions = {
   onSendError?: (error: Error) => Error | void;
 
   /**
+   * Optional wire codec. Defaults to the standard JSON codec when omitted, so
+   * the wire format is unchanged. Provide an alternative codec (e.g. CBOR) to
+   * encode messages differently. Both ends of a session must use the same codec.
+   */
+  codec?: Codec;
+
+  /**
    * EXPERIMENTAL: Restore a session from a previously-captured snapshot.
    */
   __experimental_restoreSnapshot?: RpcSessionSnapshot;
@@ -453,8 +465,14 @@ class RpcSessionImpl implements Importer, Exporter {
   // Sparse array of onBrokenCallback registrations. Items are strictly appended to the end but
   // may be deleted from the middle (hence leaving the array sparse).
   onBrokenCallbacks: ((error: any) => void)[] = [];
+
+  // Wire codec. Defaults to JSON, preserving the standard wire format.
+  private codec: Codec;
+
   constructor(private transport: RpcTransport, mainHook: StubHook,
       private options: RpcSessionOptions) {
+    this.codec = options.codec ?? jsonCodec;
+
     // Export zero is automatically the bootstrap object.
     this.exports.push({hook: mainHook, refcount: 1});
 
@@ -826,27 +844,29 @@ class RpcSessionImpl implements Importer, Exporter {
       return 0;
     }
 
-    let msgText: string;
+    let wire: string | Uint8Array;
     try {
-      msgText = JSON.stringify(msg);
+      wire = this.codec.encode(msg);
     } catch (err) {
-      // If JSON stringification failed, there's something wrong with the devaluator, as it should
-      // not allow non-JSONable values to be injected in the first place.
+      // If encoding failed, there's something wrong with the devaluator, as it should
+      // not allow non-encodable values to be injected in the first place.
       try { this.abort(err); } catch (err2) {}
       throw err;
     }
 
+    let byteLength = typeof wire === "string" ? wire.length : wire.byteLength;
+
     this.trace("send", {
       kind: msg instanceof Array ? msg[0] : typeof msg,
-      byteLength: msgText.length,
+      byteLength,
     });
 
-    this.transport.send(msgText)
+    this.transport.send(wire)
         // If send fails, abort the connection, but don't try to send an abort message since
         // that'll probably also fail.
         .catch(err => this.abort(err, false));
 
-    return msgText.length;
+    return byteLength;
   }
 
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
@@ -964,7 +984,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (trySendAbortMessage) {
       try {
-        this.transport.send(JSON.stringify(["abort", Devaluator
+        this.transport.send(this.codec.encode(["abort", Devaluator
             .devaluate(error, undefined, this)]))
             .catch(err => {});
       } catch (err) {
@@ -1020,16 +1040,16 @@ class RpcSessionImpl implements Importer, Exporter {
       let readCanceled = Promise.withResolvers<never>();
       this.cancelReadLoop = readCanceled.reject;
 
-      let msgText: string;
+      let wire: string | Uint8Array;
       try {
-        msgText = await Promise.race([this.transport.receive(), readCanceled.promise]);
+        wire = await Promise.race([this.transport.receive(), readCanceled.promise]);
       } finally {
         if (this.cancelReadLoop === readCanceled.reject) {
           this.cancelReadLoop = undefined;
         }
       }
 
-      let msg = JSON.parse(msgText);
+      let msg = this.codec.decode(wire);
       if (this.abortReason) break;  // check again before processing
       this.trace("receive", {
         kind: msg instanceof Array ? msg[0] : typeof msg,
