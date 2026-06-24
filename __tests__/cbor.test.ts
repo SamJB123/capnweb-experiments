@@ -731,3 +731,239 @@ describe("native bytes — raw on binary codecs, base64 on JSON (no accidental l
     expect(frameMax(cbor.clientSent)).toBeLessThan(frameMax(json.clientSent));
   });
 });
+
+// ---------------------------------------------------------------------------
+// importReplay rebind across hibernation, under the CBOR codec.
+//
+// The fix (producesExportId — on restore, re-bind a returned capability into its
+// export instead of disposing it) lives at the snapshot level, where exprs are
+// stored as DECODED logical structures, so it should be codec-agnostic. The
+// valuable case is STATEFUL CBOR: a wake must restore the codec's structure-table
+// state AND rebind the subscription, and the post-wake `broadcast` push is then
+// encoded against the restored codec state and decoded by the client's live
+// codec — so this exercises both restore paths at once. If either the codec
+// state restore or the rebind is wrong, the post-wake push never lands.
+// ---------------------------------------------------------------------------
+
+interface UpdateSink {
+  onUpdate(value: string): void;
+}
+
+/** Client callback that records what the server pushes to it. */
+class RecordingSink extends RpcTarget {
+  readonly received: string[] = [];
+  onUpdate(value: string): void {
+    this.received.push(value);
+  }
+}
+
+/** Server handle whose disposal is DESTRUCTIVE (removes the subscriber) — the
+ *  shape importReplay used to wrongly dispose on restore. */
+class Subscription extends RpcTarget {
+  constructor(private readonly unsubscribe: () => void) {
+    super();
+  }
+  [Symbol.dispose](): void {
+    this.unsubscribe();
+  }
+}
+
+/** A non-capturing returned capability (claimDriver-like). Its in-memory state
+ *  resets on a lazy provenance restore — like a driver resuming on next use
+ *  after a wake. */
+class Counter extends RpcTarget {
+  #n = 0;
+  bump(): number {
+    return ++this.#n;
+  }
+}
+
+/** Server capability: captures client callbacks (imported caps) and pushes to
+ *  them. The subscriber set is in-memory and rebuilt only by importReplay. */
+class Hub extends RpcTarget {
+  readonly subscribers = new Set<any>();
+  /** Captures the callback AND returns a destructive-dispose handle. */
+  subscribe(sink: any): Subscription {
+    const held = sink.dup();
+    this.subscribers.add(held);
+    return new Subscription(() => {
+      if (this.subscribers.delete(held)) held[Symbol.dispose]();
+    });
+  }
+  /** Captures the callback and returns NOTHING — the always-worked void case. */
+  subscribeVoid(sink: any): void {
+    this.subscribers.add(sink.dup());
+  }
+  /** Captures NOTHING and returns a capability — the claimDriver-like case: NOT
+   *  recorded in importReplays, restored lazily via export provenance. */
+  claim(): Counter {
+    return new Counter();
+  }
+  broadcast(value: string): void {
+    for (const sub of this.subscribers) {
+      sub.onUpdate(value)[Symbol.dispose]();
+    }
+  }
+}
+
+interface HubApi {
+  subscribe(sink: RecordingSink): any;
+  subscribeVoid(sink: RecordingSink): any;
+  claim(): any;
+  broadcast(value: string): any;
+}
+
+/** Drain queued message deliveries (and any chained ones). */
+const drain = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+/** Reconnect the live client to a fresh server transport (server-side wake). */
+function reconnect(clientT: PairTransport): PairTransport {
+  const serverT2 = new PairTransport();
+  clientT.partner = serverT2;
+  serverT2.partner = clientT;
+  return serverT2;
+}
+
+type CodecFactory = () => Codec | undefined;
+const codecOpt = (codec: Codec | undefined) => (codec ? { codec } : {});
+
+/** A connected Hub session pair under the given codec (undefined → default JSON). */
+function makeHubPair(mk: CodecFactory) {
+  const [clientT, serverT] = makePair();
+  const client = new RpcSession<HubApi>(clientT, undefined, codecOpt(mk()));
+  const server = new RpcSession(serverT, new Hub(), codecOpt(mk()));
+  return { clientT, serverT, client, server, stub: client.getRemoteMain() };
+}
+
+/** Hibernate the server: snapshot (JSON round-tripped, as a real store would),
+ *  then rebuild from it with a fresh codec on a transport reconnected to the
+ *  SAME live client. Returns the resumed server. */
+function wakeServer(clientT: PairTransport, server: RpcSession, mk: CodecFactory): RpcSession {
+  const snap = JSON.parse(JSON.stringify(server.__experimental_snapshot()));
+  const serverT2 = reconnect(clientT);
+  return new RpcSession(serverT2, new Hub(), { ...codecOpt(mk()), __experimental_restoreSnapshot: snap });
+}
+
+/** Codec configs every core scenario runs under: `[name, factory, expectsBinary]`. */
+const codecMatrix: ReadonlyArray<readonly [string, CodecFactory, boolean]> = [
+  ["JSON", () => undefined, false],
+  ["stateless CBOR", () => createCborCodec(), true],
+  ["stateful CBOR", () => createCborCodec({ stateful: true }), true],
+  ["stateful CBOR + optimizeEnvelope", () => createCborCodec({ stateful: true, optimizeEnvelope: true }), true],
+];
+
+describe("importReplay rebind across hibernation (codec matrix)", () => {
+  for (const [name, mk, binary] of codecMatrix) {
+    it(`A: a capability-returning subscription keeps pushing after a wake [${name}]`, async () => {
+      const { clientT, serverT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      const sub = await stub.subscribe(sink); // await pulls → producesExportId captured
+      expect(sub).toBeDefined();
+      await stub.broadcast("before");
+      await drain();
+      expect(sink.received).toEqual(["before"]);
+      if (binary) expect(serverT.sawBinary).toBe(true); // really used the binary codec
+
+      wakeServer(clientT, server, mk);
+
+      await stub.broadcast("after");
+      await drain();
+      // Subscription survived (rebind, not dispose); push encoded against the
+      // restored codec state and decoded by the client's live codec.
+      expect(sink.received).toEqual(["before", "after"]);
+    });
+
+    it(`B: a void-returning subscription keeps pushing after a wake [${name}]`, async () => {
+      const { clientT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      await stub.subscribeVoid(sink);
+      await stub.broadcast("before");
+      await drain();
+      expect(sink.received).toEqual(["before"]);
+
+      wakeServer(clientT, server, mk);
+
+      await stub.broadcast("after");
+      await drain();
+      expect(sink.received).toEqual(["before", "after"]);
+    });
+
+    it(`D: multiple distinct subscriptions survive a wake and dispose independently [${name}]`, async () => {
+      const { clientT, server, stub } = makeHubPair(mk);
+      const s1 = new RecordingSink();
+      const s2 = new RecordingSink();
+      const sub1 = await stub.subscribe(s1);
+      const sub2 = await stub.subscribe(s2);
+      void sub2;
+
+      wakeServer(clientT, server, mk);
+
+      await stub.broadcast("x");
+      await drain();
+      expect(s1.received).toEqual(["x"]);
+      expect(s2.received).toEqual(["x"]);
+
+      // Each handle was rebound to its OWN export — disposing one leaves the other.
+      sub1[Symbol.dispose]();
+      await drain();
+      await stub.broadcast("y");
+      await drain();
+      expect(s1.received).toEqual(["x"]); // unsubscribed
+      expect(s2.received).toEqual(["x", "y"]); // still live
+    });
+
+    it(`E: re-subscribing the same callback twice — both survive a wake, dispose independently [${name}]`, async () => {
+      const { clientT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      const subA = await stub.subscribe(sink);
+      const subB = await stub.subscribe(sink);
+      void subB;
+
+      wakeServer(clientT, server, mk);
+
+      // Two subscriptions of one callback → each broadcast reaches it twice. Both
+      // importReplays rebind to their own distinct result export.
+      await stub.broadcast("hit");
+      await drain();
+      expect(sink.received).toEqual(["hit", "hit"]);
+
+      subA[Symbol.dispose]();
+      await drain();
+      await stub.broadcast("again");
+      await drain();
+      expect(sink.received).toEqual(["hit", "hit", "again"]); // exactly one torn down
+    });
+
+    it(`F: a subscription survives two consecutive wakes [${name}]`, async () => {
+      const { clientT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      const sub = await stub.subscribe(sink);
+      void sub;
+      await stub.broadcast("a");
+      await drain();
+
+      const server2 = wakeServer(clientT, server, mk);
+      await stub.broadcast("b");
+      await drain();
+
+      wakeServer(clientT, server2, mk); // wake again from the already-restored server
+      await stub.broadcast("c");
+      await drain();
+
+      expect(sink.received).toEqual(["a", "b", "c"]);
+    });
+  }
+
+  it("C: a non-capturing capability return (claimDriver-like) is restored lazily on use after a wake [JSON & stateful CBOR]", async () => {
+    for (const mk of [(() => undefined), (() => createCborCodec({ stateful: true }))] as CodecFactory[]) {
+      const { clientT, server, stub } = makeHubPair(mk);
+      const counter = await stub.claim(); // not captured → restored via provenance, not importReplay
+      expect(await counter.bump()).toBe(1);
+
+      wakeServer(clientT, server, mk);
+
+      // Lazy provenance restore re-runs claim() on first post-wake use → fresh Counter.
+      expect(await counter.bump()).toBe(1);
+    }
+  });
+});
