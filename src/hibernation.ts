@@ -17,17 +17,19 @@ export type RpcSessionExportProvenance = {
  * restore, re-evaluating `expr` re-runs the call so its server-side side effects
  * (subscriptions, registrations) are re-established.
  *
- * If the call ALSO returned a capability the peer still holds, `producesExportId`
- * is the export id of that returned capability — captured at resolve time. On
- * restore the replay's result is bound into that export (so the peer's stub keeps
- * working) instead of being disposed. Disposing it would run the returned
- * capability's disposer, which may tear down the very side effect the replay just
- * re-established. When absent (e.g. a void-returning call), the result is
- * discarded as before.
+ * If the call ALSO returned one or more capabilities the peer still holds,
+ * `producesExportIds` lists the export ids of EVERY such capability — captured at
+ * resolve time, wherever they sit in the returned value (bare, or nested in an
+ * object/array). On restore the call is re-evaluated ONCE and each of those
+ * exports is bound to its capability from that single result (navigating the
+ * export's own provenance path), instead of the result being disposed. Disposing
+ * it would run the returned capabilities' disposers, which may tear down the very
+ * side effect the replay just re-established. When empty/absent (e.g. a
+ * void-returning call), the result is discarded as before.
  */
 export type RpcSessionImportReplay = {
   expr: unknown;
-  producesExportId?: number;
+  producesExportIds?: number[];
 };
 
 export type RpcSessionSnapshotExport = {

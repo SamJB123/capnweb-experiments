@@ -1,5 +1,15 @@
 # capnweb
 
+## 0.8.0-hibernation.2
+
+### Hibernation fork
+
+- **importReplay now rebinds *every* returned capability, including nested and multiple returns.** This generalizes the `0.8.0-hibernation.1` fix and closes its known limitation: a replay-recorded call's result is no longer required to be a *bare* `["export", N]` return. Capabilities returned **nested arbitrarily deep** inside objects/arrays, and **any number of them** from a single call, now survive a hibernation wake instead of being disposed.
+
+  `RpcSessionImportReplay.producesExportId?: number` becomes `producesExportIds?: number[]`. Capture no longer inspects the result's shape: a transient `currentResolveReplay` pointer (sibling to `currentNegativeExportProvenanceExpr`) is set around the resolve-time `Devaluator.devaluate`, and `exportStub`/`exportPromise` append **each** newly-created negative export id onto the active record. So every returned capability is registered wherever it sits in the value, with no structural special-casing. On restore, the replay re-evaluates the call **once** and binds each produced export from that single result via its own export provenance (a new non-consuming `deriveExportHookFromBase` helper, shared with the lazy `getOrRestoreExportHook` path), then disposes the shared base a single time. Each bound export holds an independent (deep-copied / pipelined) hook, so the capabilities survive on their own refcounts and disposing one never affects its siblings.
+
+  Because the navigation is driven entirely by each export's own provenance, **conditional / role-based issuance is exact across a wake**: a call that returns a different set of capabilities depending on a (literal-argument) role rebinds precisely the capabilities that were issued — no more (no privilege escalation) and no fewer (nothing silently dropped). Covered by new stress tests in `__tests__/hibernation-persistence.test.ts` (multiple, deeply-nested object/array, independent disposal, and guest/moderator/admin role-based issuance), whose effectiveness is verified by a reverting mutation that turns every one of them red when the rebinding is neutralized.
+
 ## 0.8.0-hibernation.1
 
 ### Hibernation fork
