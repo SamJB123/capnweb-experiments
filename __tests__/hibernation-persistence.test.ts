@@ -316,3 +316,214 @@ describe("hibernatable WebSocket snapshot persistence", () => {
     expect("ciphertext" in store.snapshots.get(sessionId)!).toBe(true);
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// importReplay binding: a call that BOTH captures a client capability AND
+// returns a capability must survive hibernation.
+//
+// This is the scenario uncovered in the threejs-playground: `players(writer)`
+// captured the writer (a subscription side effect) AND returned a `Subscription`
+// handle whose disposal tears the subscription down. The importReplay used to
+// re-run the call (re-establishing the subscription) and then DISPOSE the
+// returned handle — undoing the very side effect it just restored. The fix
+// records the returned capability's export id (`producesExportId`) at resolve
+// time and, on restore, binds the re-run result into that export instead of
+// disposing it.
+// ───────────────────────────────────────────────────────────────────────────
+
+interface UpdateSink {
+  onUpdate(value: string): void;
+}
+
+/** Client-side callback that records what the server pushes to it. */
+class RecordingSink extends RpcTarget {
+  readonly received: string[] = [];
+  onUpdate(value: string): void {
+    this.received.push(value);
+  }
+}
+
+/** Server-side handle whose disposal is DESTRUCTIVE — it removes the subscriber.
+ *  This mirrors the portal `Subscription`: holding it = subscribed, disposing it
+ *  = unsubscribed. It's exactly what importReplay used to wrongly dispose. */
+class Subscription extends RpcTarget {
+  constructor(private readonly unsubscribe: () => void) {
+    super();
+  }
+  [Symbol.dispose](): void {
+    this.unsubscribe();
+  }
+}
+
+/** Server capability. Captures client callbacks (imported caps) and pushes to
+ *  them. The `subscribers` set is in-memory: on a wake it starts empty and is
+ *  re-populated purely by the importReplay re-running `subscribe`. */
+class Hub extends RpcTarget {
+  readonly subscribers = new Set<any>();
+
+  /** Captures the callback AND returns a destructive-dispose handle. */
+  subscribe(sink: any): Subscription {
+    const held = sink.dup();
+    this.subscribers.add(held);
+    return new Subscription(() => {
+      if (this.subscribers.delete(held)) held[Symbol.dispose]();
+    });
+  }
+
+  /** Captures the callback and returns NOTHING — the case that always worked. */
+  subscribeVoid(sink: any): void {
+    this.subscribers.add(sink.dup());
+  }
+
+  /** Captures the callback and returns the handle NESTED inside an object.
+   *  `producesExportId` is only captured for a BARE `["export", N]` return, so
+   *  this case is not yet handled (see the "not yet supported" describe block). */
+  subscribeNested(sink: any): { handle: Subscription } {
+    const held = sink.dup();
+    this.subscribers.add(held);
+    return {
+      handle: new Subscription(() => {
+        if (this.subscribers.delete(held)) held[Symbol.dispose]();
+      }),
+    };
+  }
+
+  broadcast(value: string): void {
+    for (const sub of this.subscribers) {
+      // Fire-and-forget: the push is sent; dispose just releases the result.
+      sub.onUpdate(value)[Symbol.dispose]();
+    }
+  }
+}
+
+interface HubApi {
+  subscribe(sink: RecordingSink): any;
+  subscribeVoid(sink: RecordingSink): any;
+  subscribeNested(sink: RecordingSink): any;
+  broadcast(value: string): any;
+}
+
+/** Let queued microtask message deliveries (and any chained ones) fully drain. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Fresh store-backed (plaintext) Hub session + a connected client. */
+async function connectHub() {
+  const store = new CountingSessionStore();
+  const { client, server } = createFakeWebSocketPair();
+  const session = await __experimental_newHibernatableWebSocketRpcSession(
+    server as unknown as WebSocket,
+    new Hub(),
+    { sessionStore: store },
+  );
+  if (!session) throw new Error("failed to create hibernatable Hub session");
+  server.addEventListener("message", (e) => session.handleMessage(e.data));
+  const api = newWebSocketRpcSession<HubApi>(client as unknown as WebSocket);
+  return { store, client, server, session, api };
+}
+
+/**
+ * Simulate a Durable Object hibernation wake: capture the live snapshot, then
+ * recreate the server session from it on a FRESH socket reconnected to the SAME
+ * client. The client socket never disconnects — exactly like the DO case, where
+ * the WebSocket survives hibernation and only the server-side session is rebuilt.
+ */
+async function wake(client: FakeWebSocket, session: any, store: CountingSessionStore) {
+  const sessionId: string = session.sessionId;
+  // Stash the most current snapshot (with importReplays + producesExportId).
+  store.snapshots.set(sessionId, JSON.parse(JSON.stringify(session.__experimental_snapshot())));
+
+  const newServer = new FakeWebSocket();
+  client.connect(newServer);
+  newServer.connect(client);
+  const restored = await __experimental_newHibernatableWebSocketRpcSession(
+    newServer as unknown as WebSocket,
+    new Hub(),
+    { sessionStore: store, sessionId },
+  );
+  if (!restored) throw new Error("failed to restore hibernatable Hub session");
+  newServer.addEventListener("message", (e) => restored.handleMessage(e.data));
+  return { newServer, session: restored };
+}
+
+describe("hibernatable importReplay rebinds returned capabilities", () => {
+  it("a capability-returning subscription keeps pushing after a wake", async () => {
+    const { store, client, session, api } = await connectHub();
+    const sink = new RecordingSink();
+
+    const sub = await api.subscribe(sink); // hold the handle (pulls → producesExportId set)
+    expect(sub).toBeDefined();
+    await api.broadcast("before");
+    await flush();
+    expect(sink.received).toEqual(["before"]);
+
+    await wake(client, session, store);
+
+    await api.broadcast("after");
+    await flush();
+    // Pre-fix this was ["before"]: the importReplay re-established the subscription
+    // and then disposed the returned Subscription, tearing it back down.
+    expect(sink.received).toEqual(["before", "after"]);
+  });
+
+  it("a void-returning subscription still survives a wake (regression guard)", async () => {
+    const { store, client, session, api } = await connectHub();
+    const sink = new RecordingSink();
+
+    await api.subscribeVoid(sink);
+    await api.broadcast("before");
+    await flush();
+    expect(sink.received).toEqual(["before"]);
+
+    await wake(client, session, store);
+
+    await api.broadcast("after");
+    await flush();
+    expect(sink.received).toEqual(["before", "after"]);
+  });
+
+  it("the returned handle still unsubscribes after a wake (no double-subscription)", async () => {
+    const { store, client, session, api } = await connectHub();
+    const sink = new RecordingSink();
+
+    const sub = await api.subscribe(sink);
+    await wake(client, session, store);
+
+    await api.broadcast("one");
+    await flush();
+    expect(sink.received).toEqual(["one"]);
+
+    // Disposing the restored handle must tear down exactly one subscription.
+    sub[Symbol.dispose]();
+    await flush();
+    await api.broadcast("two");
+    await flush();
+    expect(sink.received).toEqual(["one"]); // "two" not delivered — unsubscribed
+  });
+});
+
+describe("hibernatable importReplay: nested capability returns (not yet supported — expected to fail)", () => {
+  // These document a known gap: `producesExportId` is only captured for a bare
+  // `["export", N]` return, not a capability nested inside an object/array. Until
+  // that is implemented, the importReplay disposes the nested handle on restore
+  // and tears the subscription down. They are intentionally RED.
+  it("a subscription whose handle is returned nested in an object keeps pushing after a wake", async () => {
+    const { store, client, session, api } = await connectHub();
+    const sink = new RecordingSink();
+
+    const result = await api.subscribeNested(sink);
+    const handle = result.handle; // hold the nested handle
+    expect(handle).toBeDefined();
+    await api.broadcast("before");
+    await flush();
+    expect(sink.received).toEqual(["before"]);
+
+    await wake(client, session, store);
+
+    await api.broadcast("after");
+    await flush();
+    // EXPECTED TO FAIL until nested returns are supported: stays ["before"].
+    expect(sink.received).toEqual(["before", "after"]);
+  });
+});
