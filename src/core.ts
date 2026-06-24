@@ -224,7 +224,7 @@ export function typeForRpc(value: unknown): TypeForRpc {
     case Blob.prototype:
       return "blob";
 
-    // TODO: All other structured clone types.
+    // TODO: Other RPC-compatible pass-by-value types.
 
     case RpcStub.prototype:
       return "stub";
