@@ -1,5 +1,9 @@
 # capnweb
 
+## 0.8.0-hibernation-cbor.7
+
+Merges `0.8.0-hibernation.3` into the CBOR experiment line: adds the built-in WebCrypto snapshot security helper (`__experimental_newWebCryptoSnapshotSecurity`) and the adversarial security test suite — see the `0.8.0-hibernation.3` entry below for full details. No CBOR-codec changes.
+
 ## 0.8.0-hibernation-cbor.6
 
 Merges `0.8.0-hibernation.2` into the CBOR experiment line: the importReplay returned-capability rebind fix now covers nested and multiple returns (`producesExportIds`) — see the `0.8.0-hibernation.2` entry below for full details. No CBOR-codec changes.
@@ -50,6 +54,25 @@ Experimental prerelease published under the npm `experimental` dist-tag (not `la
 
 - The built-in transports (WebSocket, hibernatable WebSocket, MessagePort, Bun, HTTP batch) now carry `string | Uint8Array`; the JSON path is unchanged.
 - This build is unit/integration-tested but not yet exercised in a live runtime (real WebSocket / Durable Object hibernate-wake cycle). Treat as experimental.
+
+## 0.8.0-hibernation.3
+
+### Hibernation fork
+
+- **Built-in WebCrypto snapshot security: `__experimental_newWebCryptoSnapshotSecurity`.** A ready-made `HibernatableSnapshotSecurity` so consumers no longer hand-roll the AES-GCM envelope. Pass the result as `snapshotSecurity` when creating a hibernatable session:
+
+  ```ts
+  const security = __experimental_newWebCryptoSnapshotSecurity(env.MY_SNAPSHOT_SECRET);
+  // … { snapshotSecurity: security, snapshotSecurityAssociatedData: { userId } }
+  ```
+
+  It derives two subkeys from one high-entropy `secret` (SHA-256 with distinct domain-separation labels) — AES-GCM for `seal`/`open` (confidentiality + integrity) and HMAC-SHA-256 for the `fingerprint` write-elision marker — and binds the library-provided `associatedData` (which already folds in `sessionId` and the storage mode) as AES-GCM additional data, so a snapshot sealed for one session/user cannot be opened in another. `required` defaults to `true` (plaintext snapshots are refused on restore); an empty secret throws.
+
+  The point of sealing, restated: a hibernation snapshot carries `importReplays` that are re-executed on wake, and it is persisted in DO storage / the WebSocket attachment. If an attacker can *write* that store, the only thing that stops a forged snapshot from being restored and replayed is a verification key they cannot reach — and the library's own storage *is* the thing under attack. So the `secret` must come from **outside** the snapshot store (a Worker secret binding, a KMS), never from DO storage or client input. The library supplies the enforcement (seal/open, reject-on-failure, `required`, context binding); you supply the key.
+
+  The wire format (key-derivation labels, `AES-GCM` algorithm tag, base64url envelope fields) is fixed and matches the implementation previously carried in `@aicolab/room-service`, so snapshots sealed by that code remain openable after switching to this export — no session loss.
+
+- **Adversarial security test suite (`__tests__/security.test.ts`).** Drives a real server `RpcSession` with raw, attacker-controlled protocol frames — not the typed client, which would never emit an attack — and asserts the **secure** outcome as each test's pass condition, so a genuine gap shows up as a failure rather than being assumed away. Coverage: data/capability confusion (escaping), forged capability references, prototype pollution, property/method access control, refcount/lifetime abuse, malformed frames, map-program sandboxing, and the hibernation snapshot trust boundary. Two snapshot tests are intentionally **red**: they assert a forged `importReplay` must NOT execute, which only holds once the snapshot is sealed with a key from outside the store — they document that dependency empirically instead of hiding it behind a green check.
 
 ## 0.8.0-hibernation.2
 

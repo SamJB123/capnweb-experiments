@@ -22,6 +22,7 @@ export default defineConfig({
             '__tests__/flow-control.test.ts',
             '__tests__/hibernation-persistence.test.ts',
             '__tests__/cbor.test.ts',
+            '__tests__/security.test.ts',
             'packages/capnweb-validate/__tests__/**/*.test.ts',
           ],
           environment: 'node',
