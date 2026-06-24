@@ -1,10 +1,10 @@
 node_modules
 .wrangler/
-examples/worker-react/web/dist/
+examples/worker-react/client/dist/
 notes.txt
 /dist/
 /hibernation-tests/.wrangler-old-1776422837
 /hibernation-tests/dist
-/hibernation-tests/dist
 /tanstack-db
 .claude/settings.local.json
+packages/*/dist/
