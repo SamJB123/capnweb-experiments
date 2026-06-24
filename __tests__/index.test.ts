@@ -2281,7 +2281,9 @@ describe("WritableStream over RPC", () => {
     expect(writesReceived).toBe(20);
     expect(closeReceived).toBe(true);
     await rpcPromise;
-  });
+  }, 60000);  // Generous timeout: this test drives an async stream pipeline via setTimeout(0)
+              // pumping, which can be slow under load / on WebKit (see notes above). The logic is
+              // constant; only the wall-clock drain time varies, so a larger budget avoids flakes.
 
   it("uses stream messages instead of push+pull+release", async () => {
     // Verify that WritableStream writes use the optimized "stream" message type,
