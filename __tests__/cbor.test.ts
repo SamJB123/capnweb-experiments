@@ -804,6 +804,62 @@ class Hub extends RpcTarget {
       sub.onUpdate(value)[Symbol.dispose]();
     }
   }
+
+  // ── named channels for the multi-from-one-call (G) and nested (H) cases ──
+  // In-memory like `subscribers`: empty on a wake, repopulated only by the
+  // importReplay re-running the issuing call.
+  readonly topics = new Map<string, Set<any>>();
+
+  /** Subscribe `sink` to a topic, returning a destructive-dispose handle.
+   *  Private, so it is not part of the RPC surface. */
+  #subscribeTopic(topic: string, sink: any): Subscription {
+    const held = sink.dup();
+    let set = this.topics.get(topic);
+    if (!set) {
+      set = new Set();
+      this.topics.set(topic, set);
+    }
+    set.add(held);
+    return new Subscription(() => {
+      if (set!.delete(held)) held[Symbol.dispose]();
+    });
+  }
+
+  /** Push to one topic's subscribers, tagging the value with the topic. */
+  broadcastTopic(topic: string, value: string): void {
+    for (const sub of this.topics.get(topic) ?? []) {
+      sub.onUpdate(`${topic}:${value}`)[Symbol.dispose]();
+    }
+  }
+
+  /** ONE call → SEVERAL returned capabilities (two topic subscriptions + a
+   *  non-capturing counter) in a flat object. Exercises a single replay record
+   *  whose `producesExportIds` has length > 1, plus a mixed capturing /
+   *  non-capturing return, all encoded in one resolve payload. */
+  issueAll(sink: any): { alerts: Subscription; news: Subscription; counter: Counter } {
+    return {
+      alerts: this.#subscribeTopic("alerts", sink),
+      news: this.#subscribeTopic("news", sink),
+      counter: new Counter(),
+    };
+  }
+
+  /** ONE call → capabilities buried deep inside nested objects AND arrays. This
+   *  is the shape that stresses `optimizeEnvelope`'s reshaping of buried
+   *  `["export", N]` tokens and the stateful structure table on a richer
+   *  payload, end-to-end through a wake. */
+  issueNested(sink: any): {
+    rooms: { feed: Subscription }[];
+    admin: { panel: { audit: Subscription } };
+  } {
+    return {
+      rooms: [
+        { feed: this.#subscribeTopic("room-0", sink) },
+        { feed: this.#subscribeTopic("room-1", sink) },
+      ],
+      admin: { panel: { audit: this.#subscribeTopic("audit", sink) } },
+    };
+  }
 }
 
 interface HubApi {
@@ -811,6 +867,9 @@ interface HubApi {
   subscribeVoid(sink: RecordingSink): any;
   claim(): any;
   broadcast(value: string): any;
+  broadcastTopic(topic: string, value: string): any;
+  issueAll(sink: RecordingSink): any;
+  issueNested(sink: RecordingSink): any;
 }
 
 /** Drain queued message deliveries (and any chained ones). */
@@ -951,6 +1010,51 @@ describe("importReplay rebind across hibernation (codec matrix)", () => {
       await drain();
 
       expect(sink.received).toEqual(["a", "b", "c"]);
+    });
+
+    it(`G: multiple capabilities returned from ONE call all survive a wake [${name}]`, async () => {
+      const { clientT, serverT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      const bundle = await stub.issueAll(sink); // { alerts, news, counter } — held
+      expect(await bundle.counter.bump()).toBe(1);
+      await stub.broadcastTopic("alerts", "a1");
+      await stub.broadcastTopic("news", "n1");
+      await drain();
+      expect(sink.received).toEqual(["alerts:a1", "news:n1"]);
+      if (binary) expect(serverT.sawBinary).toBe(true);
+
+      wakeServer(clientT, server, mk);
+
+      await stub.broadcastTopic("alerts", "a2");
+      await stub.broadcastTopic("news", "n2");
+      await drain();
+      // Every export from the single resolve rebound from one re-run result —
+      // the producesExportIds-with-length>1 path, encoded/decoded by the codec.
+      expect(sink.received).toEqual(["alerts:a1", "news:n1", "alerts:a2", "news:n2"]);
+      // The non-capturing counter rebinds too (fresh instance; a broken stub throws).
+      expect(await bundle.counter.bump()).toBe(1);
+    });
+
+    it(`H: capabilities nested deep in objects AND arrays survive a wake [${name}]`, async () => {
+      const { clientT, serverT, server, stub } = makeHubPair(mk);
+      const sink = new RecordingSink();
+      const tree = await stub.issueNested(sink); // rooms[0..1].feed + admin.panel.audit
+      expect(tree.rooms.length).toBe(2);
+      for (const t of ["room-0", "room-1", "audit"]) await stub.broadcastTopic(t, "x");
+      await drain();
+      expect(sink.received).toEqual(["room-0:x", "room-1:x", "audit:x"]);
+      if (binary) expect(serverT.sawBinary).toBe(true);
+
+      wakeServer(clientT, server, mk);
+
+      // Buried ["export", N] tokens round-tripped through the codec (incl.
+      // optimizeEnvelope's array→map reshape) and each rebound on restore.
+      for (const t of ["room-0", "room-1", "audit"]) await stub.broadcastTopic(t, "y");
+      await drain();
+      expect(sink.received).toEqual([
+        "room-0:x", "room-1:x", "audit:x",
+        "room-0:y", "room-1:y", "audit:y",
+      ]);
     });
   }
 
