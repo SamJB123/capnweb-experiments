@@ -20,6 +20,7 @@ import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serializ
 import { __experimental_recordInputPath } from "./map.js";
 import type {
   RpcSessionExportProvenance,
+  RpcSessionImportReplay,
   RpcSessionSnapshot,
 } from "./hibernation.js";
 import { type Codec, jsonCodec } from "./codec/index.js";
@@ -76,7 +77,16 @@ type ExportTableEntry = {
   // If this export was created by a ["pipe"] message, this holds the ReadableStream end of the
   // pipe. It is consumed (and set to undefined) when a ["readable", importId] expression
   // references this export.
-  pipeReadable?: ReadableStream
+  pipeReadable?: ReadableStream,
+
+  // For a positive export created by a ["push"] whose call captured an imported
+  // capability: a reference to the importReplay record recorded for that call.
+  // When the call's result resolves to a returned capability, that capability's
+  // export id is written onto this record (`producesExportId`) so that, on
+  // restore, the replay binds its result into that export instead of disposing
+  // it. Transient (not snapshotted) — the link only needs to survive until the
+  // result resolves and the id is captured.
+  replayRecord?: RpcSessionImportReplay,
 };
 
 // Entry on the imports table.
@@ -433,12 +443,10 @@ function cloneRpcExpr<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
-function cloneRpcProvenance(provenance: RpcSessionExportProvenance): RpcSessionExportProvenance {
+function cloneImportReplay(replay: RpcSessionImportReplay): RpcSessionImportReplay {
   return {
-    expr: cloneRpcExpr(provenance.expr),
-    ...(provenance.captures ? { captures: cloneRpcExpr(provenance.captures) } : {}),
-    ...(provenance.instructions ? { instructions: cloneRpcExpr(provenance.instructions) } : {}),
-    ...(provenance.path ? { path: cloneRpcExpr(provenance.path) } : {}),
+    expr: cloneRpcExpr(replay.expr),
+    ...(replay.producesExportId !== undefined ? { producesExportId: replay.producesExportId } : {}),
   };
 }
 
@@ -446,7 +454,7 @@ class RpcSessionImpl implements Importer, Exporter {
   private exports: Array<ExportTableEntry> = [];
   private reverseExports: Map<StubHook, ExportId> = new Map();
   private imports: Array<ImportTableEntry> = [];
-  private importReplays: RpcSessionExportProvenance[] = [];
+  private importReplays: RpcSessionImportReplay[] = [];
   private abortReason?: any;
   private cancelReadLoop?: (error: any) => void;
 
@@ -685,6 +693,15 @@ class RpcSessionImpl implements Importer, Exporter {
             value = Devaluator.devaluate(payload.value, undefined, this, payload);
           } finally {
             this.currentNegativeExportProvenanceExpr = previousExpr;
+          }
+          // If this call was replay-recorded AND it resolved to a (bare) returned
+          // capability, record that capability's export id on the replay record.
+          // On restore the replay re-runs the call and binds its result into this
+          // export rather than disposing it (which would run the capability's
+          // disposer and undo the side effect the replay just re-established).
+          if (exp.replayRecord &&
+              Array.isArray(value) && value[0] === "export" && typeof value[1] === "number") {
+            exp.replayRecord.producesExportId = value[1];
           }
           this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
           this.send(["resolve", exportId, value]);
@@ -1081,8 +1098,10 @@ class RpcSessionImpl implements Importer, Exporter {
               // RpcStub proxies. Cloning afterwards via JSON.stringify would invoke
               // .toJSON on those proxies, generating spurious RPC pipeline calls.
               let sourceExpr = cloneRpcExpr(msg[2]);
+              let replayRecord: RpcSessionImportReplay | undefined;
               if (containsImportedCapabilityReference(msg[2])) {
-                this.importReplays.push({ expr: sourceExpr });
+                replayRecord = { expr: sourceExpr };
+                this.importReplays.push(replayRecord);
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
                   replayCount: this.importReplays.length,
@@ -1100,6 +1119,10 @@ class RpcSessionImpl implements Importer, Exporter {
                 hook,
                 refcount: 1,
                 sourceExpr,
+                // Link the call-result slot to its replay record so that, when the
+                // result resolves to a returned capability, we can record that
+                // capability's export id on the record (see ensureResolvingExport).
+                ...(replayRecord ? { replayRecord } : {}),
               });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
@@ -1397,15 +1420,31 @@ class RpcSessionImpl implements Importer, Exporter {
     }
 
     if (snapshot.importReplays && snapshot.importReplays.length > 0) {
-      this.importReplays = snapshot.importReplays.map(cloneRpcProvenance);
+      this.importReplays = snapshot.importReplays.map(cloneImportReplay);
       for (let replay of this.importReplays) {
         this.trace("restoreFromSnapshot.importReplay.begin", {
-          hasCaptures: !!replay.captures?.length,
-          instructionCount: replay.instructions?.length ?? 0,
-          pathLength: replay.path?.length ?? 0,
+          producesExportId: replay.producesExportId,
         });
+        // Re-evaluating the call re-establishes its server-side side effects
+        // (e.g. re-subscribing). This runs synchronously, before any inbound
+        // message is processed.
         let payload = new Evaluator(this).evaluate(cloneRpcExpr(replay.expr));
-        payload.dispose();
+        let producesExportId = replay.producesExportId;
+        let entry = producesExportId !== undefined ? this.exports[producesExportId] : undefined;
+        if (entry && !entry.hook) {
+          // The replayed call returned a capability the peer still holds. Bind the
+          // re-run result in as that export's hook instead of disposing it. The lazy
+          // getOrRestoreExportHook then finds the hook already present and skips
+          // re-running, so the call is reconstructed exactly once.
+          let hook = new PayloadStubHook(payload);
+          entry.hook = hook;
+          this.reverseExports.set(hook, producesExportId!);
+          this.trace("restoreFromSnapshot.importReplay.bind", { exportId: producesExportId });
+        } else {
+          // Void result, or the peer already released the returned capability — the
+          // side effect has been re-established, so the result itself is discardable.
+          payload.dispose();
+        }
       }
     }
 

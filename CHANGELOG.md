@@ -1,5 +1,9 @@
 # capnweb
 
+## 0.8.0-hibernation-cbor.5
+
+Merges `0.8.0-hibernation.1` into the CBOR experiment line: the importReplay returned-capability rebind fix (`producesExportId`) — see the `0.8.0-hibernation.1` entry below for full details. No CBOR-codec changes.
+
 ## 0.8.0-hibernation-cbor.2
 
 Experimental prerelease (npm `experimental` dist-tag). Iterates on the CBOR codec from `0.8.0-hibernation-cbor.1`.
@@ -42,6 +46,16 @@ Experimental prerelease published under the npm `experimental` dist-tag (not `la
 
 - The built-in transports (WebSocket, hibernatable WebSocket, MessagePort, Bun, HTTP batch) now carry `string | Uint8Array`; the JSON path is unchanged.
 - This build is unit/integration-tested but not yet exercised in a live runtime (real WebSocket / Durable Object hibernate-wake cycle). Treat as experimental.
+
+## 0.8.0-hibernation.1
+
+### Hibernation fork
+
+- **importReplay now rebinds a returned capability instead of disposing it.** A hibernatable call that *both* captured a client capability (so it was recorded in `importReplays`) *and* returned a capability the peer holds — e.g. a `subscribe(callback)` that returns a destructive-dispose `Subscription` handle — was previously broken across hibernation. On restore, `restoreFromSnapshot` re-evaluated the call (correctly re-establishing the side effect) and then `payload.dispose()`'d the result, running the returned capability's disposer and tearing down the very side effect it had just re-established — so the peer stopped receiving pushes after a wake. (A `subscribe(callback)` returning `void` was unaffected — disposing a void result is a no-op. A capability-returning call that captured nothing — e.g. `claimDriver()` — was also unaffected: it isn't recorded in `importReplays` and is restored lazily via export provenance.)
+
+  The fix threads capnweb's own export id end to end, with no expression deep-comparison. When a replay-recorded call's result resolves to a **bare** `["export", N]` return, that capability's export id is recorded on the replay record as `producesExportId` (a field on the new `RpcSessionImportReplay` snapshot type). On restore the replay re-runs the call and **binds** its result in as that export's hook instead of disposing it; the lazy `getOrRestoreExportHook` then finds the hook already present and skips re-running — so the call is reconstructed exactly once, with no destructive disposal and no double reconstruction. The link is anchored on the positive call-result export slot (`ExportTableEntry.replayRecord`, transient), so it stays exact even for repeated identical calls.
+
+  Known limitation: `producesExportId` is captured only for a bare `["export", N]` return. A capability returned *nested* inside an object or array is not yet rebound and is still disposed on restore. This is covered by an intentionally-failing test in `__tests__/hibernation-persistence.test.ts` ("nested capability returns (not yet supported)").
 
 ## 0.8.0-hibernation.0
 

@@ -11,6 +11,25 @@ export type RpcSessionExportProvenance = {
   path?: PropertyPath;
 };
 
+/**
+ * A replayable inbound call that introduced an imported capability into local
+ * application state (e.g. `subscribe(callback)` capturing the callback). On
+ * restore, re-evaluating `expr` re-runs the call so its server-side side effects
+ * (subscriptions, registrations) are re-established.
+ *
+ * If the call ALSO returned a capability the peer still holds, `producesExportId`
+ * is the export id of that returned capability — captured at resolve time. On
+ * restore the replay's result is bound into that export (so the peer's stub keeps
+ * working) instead of being disposed. Disposing it would run the returned
+ * capability's disposer, which may tear down the very side effect the replay just
+ * re-established. When absent (e.g. a void-returning call), the result is
+ * discarded as before.
+ */
+export type RpcSessionImportReplay = {
+  expr: unknown;
+  producesExportId?: number;
+};
+
 export type RpcSessionSnapshotExport = {
   id: number;
   refcount: number;
@@ -57,7 +76,7 @@ export type RpcSessionSnapshot = {
   /** Replayable inbound calls that introduced imported capabilities into local
    *  application state. Replaying these after restore rebuilds app-held
    *  references without requiring application-layer persistence. */
-  importReplays?: RpcSessionExportProvenance[];
+  importReplays?: RpcSessionImportReplay[];
   /** Stateful wire-codec state (version 3+). Present only when the session's
    *  codec implements `snapshotState()`. The default JSON codec omits this. */
   codec?: RpcSessionCodecState;
