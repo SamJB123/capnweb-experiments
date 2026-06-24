@@ -33,6 +33,8 @@ forceInitStreams();
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
          nodeHttpBatchRpcResponse };
 export { __experimental_newDurableObjectSessionStore } from "./hibernation.js";
+export { __experimental_newWebCryptoSnapshotSecurity } from "./snapshot-security.js";
+export type { WebCryptoSnapshotSecurityOptions } from "./snapshot-security.js";
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
 export type {
   HibernatableEncryptedSnapshotEnvelope,

@@ -7,6 +7,7 @@ import {
   RpcTarget,
   newWebSocketRpcSession,
   __experimental_newHibernatableWebSocketRpcSession,
+  __experimental_newWebCryptoSnapshotSecurity,
   type HibernatableSnapshotSecurity,
   type HibernatableWebSocketOptions,
   type HibernatableSessionStore,
@@ -738,5 +739,67 @@ describe("hibernatable importReplay: conditional / role-based capability issuanc
     await flush();
     const granted = ALL_TOPICS.filter((t) => sink.received.includes(`${t}:ping`));
     expect(granted).toEqual(["read", "shutdown"]); // kick gone, others intact
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// The built-in WebCrypto snapshot-security helper (lifted into the fork so
+// consumers don't hand-roll AES-GCM). Sealing keyed from outside the snapshot
+// store is the only thing that makes a forged/tampered snapshot unforgeable to
+// a store-writer, so this is core to the fork.
+// ───────────────────────────────────────────────────────────────────────────
+describe("__experimental_newWebCryptoSnapshotSecurity", () => {
+  const sec = __experimental_newWebCryptoSnapshotSecurity("a-high-entropy-secret");
+
+  it("round-trips a sealed snapshot, and the plaintext is not on the wire", async () => {
+    const env = await sec.seal({ plaintext: '{"secret":"hunter2"}', associatedData: "ctx" });
+    expect(env.kind).toBe("encrypted");
+    expect(env.alg).toBe("AES-GCM");
+    expect(JSON.stringify(env)).not.toContain("hunter2"); // confidentiality
+    expect(await sec.open({ envelope: env, associatedData: "ctx" })).toBe('{"secret":"hunter2"}');
+  });
+
+  it("rejects a tampered ciphertext (integrity)", async () => {
+    const env = await sec.seal({ plaintext: "hello", associatedData: "ctx" });
+    const flipped = (env.ciphertext[0] === "A" ? "B" : "A") + env.ciphertext.slice(1);
+    await expect(sec.open({ envelope: { ...env, ciphertext: flipped }, associatedData: "ctx" }))
+      .rejects.toThrow();
+  });
+
+  it("rejects an associatedData mismatch (context binding stops cross-session replay)", async () => {
+    const env = await sec.seal({ plaintext: "hello", associatedData: "ctxA" });
+    await expect(sec.open({ envelope: env, associatedData: "ctxB" })).rejects.toThrow();
+  });
+
+  it("defaults to required:true, and refuses an empty secret", () => {
+    expect(sec.required).toBe(true);
+    expect(__experimental_newWebCryptoSnapshotSecurity("x", { required: false }).required).toBe(false);
+    expect(() => __experimental_newWebCryptoSnapshotSecurity("")).toThrow(/secret/i);
+  });
+
+  it("end-to-end: a session sealed with it survives a wake, and a tampered store entry is refused", async () => {
+    const store = new CountingSessionStore();
+    const { client, server } = createFakeWebSocketPair();
+    const security = __experimental_newWebCryptoSnapshotSecurity("e2e-secret");
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+      server as unknown as WebSocket, new EchoTarget(),
+      { sessionStore: store, snapshotSecurity: security, snapshotSecurityAssociatedData: { u: "1" } });
+    if (!session) throw new Error("failed to create session");
+    server.addEventListener("message", (e) => session.handleMessage(e.data));
+    const api = newWebSocketRpcSession<EchoApi>(client as unknown as WebSocket);
+    expect(await api.echo("hi")).toBe("hi");
+
+    // The stored snapshot is an encrypted envelope, not plaintext.
+    const stored = store.snapshots.get(session.sessionId) as any;
+    expect(stored.kind).toBe("encrypted");
+
+    // Tamper it; a fresh session restoring from the store must refuse it.
+    stored.ciphertext = (stored.ciphertext[0] === "A" ? "B" : "A") + stored.ciphertext.slice(1);
+    store.snapshots.set(session.sessionId, stored);
+    const { server: server2 } = createFakeWebSocketPair();
+    const restored = await __experimental_newHibernatableWebSocketRpcSession(
+      server2 as unknown as WebSocket, new EchoTarget(),
+      { sessionStore: store, sessionId: session.sessionId, snapshotSecurity: security, snapshotSecurityAssociatedData: { u: "1" } });
+    expect(restored).toBeUndefined(); // tampered snapshot rejected, fail-closed
   });
 });
