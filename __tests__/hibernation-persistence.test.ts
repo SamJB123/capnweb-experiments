@@ -803,3 +803,216 @@ describe("__experimental_newWebCryptoSnapshotSecurity", () => {
     expect(restored).toBeUndefined(); // tampered snapshot rejected, fail-closed
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DIAGNOSED BUG — to be fixed in capnweb. Read this before touching the fix.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// SYMPTOM (production): the user-hub Durable Object closes the WebSocket with
+// `1011 "stale session"` on a hibernation WAKE — e.g. saving an avatar wakes the
+// hibernated DO, the wake restore fails, the socket closes.
+//
+// SHAPE that triggers it: a CAPTURING call made on a NESTED, PIPELINED
+// capability. Concretely `cap.persona().avatar(writer)`:
+//   1. `persona()` is a call RESULT → a transient POSITIVE export on the server.
+//   2. `avatar(writer)` captures a client export (the writer) → capnweb records
+//      an `importReplay` whose call BASE is `["pipeline", <positive persona
+//      export>, ["avatar"], [writer]]`.
+//   3. The snapshot serializer (`rpc.ts` `__experimental_snapshot`, the
+//      `if (id >= 0) continue` guard) serializes ONLY NEGATIVE exports. Positive
+//      call-result exports are dropped — they're meant to be transient.
+//   4. On wake, `restoreFromSnapshot` evaluates each importReplay's expr. The
+//      avatar replay's base references that dropped positive export →
+//      `getExport(N)` returns undefined → serialize.ts throws "no such entry on
+//      exports table: N" → caught in hibernation.ts → close `1011 stale session`.
+//
+// WHY THE EXISTING NESTED TESTS PASS (the suite above): every one of them makes
+// the capturing call directly on the MAIN cap — `api.subscribe(sink)`,
+// `api.subscribeNested(sink)`, `api.issueAll(sink)`, etc. Their base is import 0
+// / export 0 (the bootstrap), which is ALWAYS present after restore. "Nested" in
+// those tests means the RETURNED capability is nested in objects/arrays — NOT
+// that the CALL is made on a nested (call-result) capability. None of them
+// exercise a capturing call whose base is a pipelined positive export, which is
+// exactly the gap.
+//
+// CONTROLS BELOW pin the cause:
+//   REPRO (nested persona().avatar(writer), capturing)  → FAILS  (positive base dropped)
+//   A (hold persona+files only, no stream)               → OK     (no importReplay at all)
+//   B (nested stream, NO dup)                             → FAILS  (dup is NOT the cause —
+//                                                                   the writer is still an arg, so the
+//                                                                   importReplay + positive base still exist;
+//                                                                   dup only shifts timing)
+//   C (capturing stream FLAT on main, with dup)          → OK     (base = export 0)
+//   D (nested, but AWAIT persona() first)                → OK     (base RESOLVES to a durable NEGATIVE
+//                                                                   export, which IS snapshotted with provenance)
+//
+// TIMING CAVEAT: REPRO/B are timing-sensitive — they race `persona()` resolution
+// against when the snapshot is captured (and leaked sessions from earlier tests
+// perturb that timing in this file). The DETERMINISTIC signals are C and D
+// (always green) plus the code path itself. When implementing the fix, make
+// REPRO deterministically green and consider isolating/closing sessions between
+// tests to remove the race.
+//
+// THE FIX (capnweb, proper): when a pipelined-promise base (a positive
+// call-result export) RESOLVES to a durable negative export, rewrite the
+// importReplay's base reference from the transient positive id to that resolved
+// negative id — which IS serialized, with its own provenance (e.g. persona's
+// negative export carries `main.persona()` provenance). Do it either at resolve
+// time (`ensureResolvingExport`) or by resolving positive references at snapshot
+// time (`__experimental_snapshot`). Must not regress the security / nested-return
+// suites above.
+//
+// APP-SIDE UNBLOCK already shipped: user-hub `await`s `cap.persona()` / `cap.files()`
+// so the stream base is a negative export from the start (control D). That keeps
+// production working; this capnweb fix removes the foot-gun so a *pipelined* base
+// survives too.
+// ═══════════════════════════════════════════════════════════════════════════
+describe("held nested applet capabilities + avatar stream survive a wake", () => {
+  class WriterTarget extends RpcTarget {
+    readonly writes: string[] = [];
+    begin() {}
+    write(v: string) {
+      this.writes.push(v);
+    }
+    commit() {}
+  }
+  class Subscription extends RpcTarget {
+    constructor(private readonly teardown: () => void) {
+      super();
+    }
+    [Symbol.dispose]() {
+      this.teardown();
+    }
+  }
+  class PersonaTarget extends RpcTarget {
+    // collection-sync stream(): dup the client writer (params are disposed on
+    // return), hold the dup in the Subscription's teardown.
+    avatar(writer: any): Subscription {
+      const duped = writer.dup();
+      return new Subscription(() => {
+        duped[Symbol.dispose]();
+      });
+    }
+  }
+  class FilesTarget extends RpcTarget {
+    ping(): string {
+      return "files";
+    }
+  }
+  class MainTarget extends RpcTarget {
+    #persona?: PersonaTarget;
+    #files?: FilesTarget;
+    persona(): PersonaTarget {
+      return (this.#persona ??= new PersonaTarget());
+    }
+    files(): FilesTarget {
+      return (this.#files ??= new FilesTarget());
+    }
+  }
+  // Variant where avatar does NOT dup the writer (isolates whether dup is the cause).
+  class PersonaNoDupTarget extends RpcTarget {
+    avatar(_writer: any): Subscription {
+      return new Subscription(() => {});
+    }
+  }
+  class MainNoDupTarget extends RpcTarget {
+    #persona?: PersonaNoDupTarget;
+    #files?: FilesTarget;
+    persona() {
+      return (this.#persona ??= new PersonaNoDupTarget());
+    }
+    files() {
+      return (this.#files ??= new FilesTarget());
+    }
+  }
+  // Variant where avatar is on the MAIN cap directly (isolates whether the
+  // persona NESTING is the cause).
+  class MainFlatTarget extends RpcTarget {
+    #files?: FilesTarget;
+    avatar(writer: any): Subscription {
+      const duped = writer.dup();
+      return new Subscription(() => duped[Symbol.dispose]());
+    }
+    files() {
+      return (this.#files ??= new FilesTarget());
+    }
+  }
+
+  // Connect, run `exercise` (which retains stubs in `held`), snapshot, then WAKE
+  // from the snapshot in a fresh server session. Returns the wake outcome.
+  async function runWake(
+    makeMain: () => RpcTarget,
+    exercise: (api: any, held: unknown[]) => Promise<void>,
+  ): Promise<{ ok: boolean; reason: string }> {
+    const store = new CountingSessionStore();
+    const security = __experimental_newWebCryptoSnapshotSecurity("held-caps-secret");
+    const assoc = { userId: "u1" };
+    const { client, server } = createFakeWebSocketPair();
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+      server as unknown as WebSocket,
+      makeMain(),
+      { sessionStore: store, snapshotSecurity: security, snapshotSecurityAssociatedData: assoc },
+    );
+    if (!session) throw new Error("failed to create session");
+    server.addEventListener("message", (e) => session.handleMessage(e.data));
+    const api = newWebSocketRpcSession<any>(client as unknown as WebSocket);
+    const held: unknown[] = [];
+    await exercise(api, held);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(store.snapshots.has(session.sessionId)).toBe(true);
+    const { server: server2 } = createFakeWebSocketPair();
+    const restored = await __experimental_newHibernatableWebSocketRpcSession(
+      server2 as unknown as WebSocket,
+      makeMain(),
+      {
+        sessionStore: store,
+        sessionId: session.sessionId,
+        snapshotSecurity: security,
+        snapshotSecurityAssociatedData: assoc,
+      },
+    );
+    void held; // keep stubs referenced through the wake
+    return { ok: !!restored, reason: server2.closeReason };
+  }
+
+  it("REPRO — nested persona().avatar(writer) with dup, persona+files+sub held", async () => {
+    const r = await runWake(() => new MainTarget(), async (api, held) => {
+      const persona = api.persona();
+      const files = api.files();
+      held.push(persona, files, await persona.avatar(new WriterTarget()));
+    });
+    console.log("[REPRO]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+    expect(r.reason).not.toBe("stale session");
+    expect(r.ok).toBe(true);
+  });
+
+  it("control A — hold persona + files only, NO avatar stream", async () => {
+    const r = await runWake(() => new MainTarget(), async (api, held) => {
+      held.push(api.persona(), api.files());
+    });
+    console.log("[A no-stream]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+  });
+
+  it("control B — nested avatar stream WITHOUT writer.dup()", async () => {
+    const r = await runWake(() => new MainNoDupTarget(), async (api, held) => {
+      const persona = api.persona();
+      held.push(persona, api.files(), await persona.avatar(new WriterTarget()));
+    });
+    console.log("[B no-dup]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+  });
+
+  it("control C — avatar stream WITH dup but NO persona nesting (flat on main)", async () => {
+    const r = await runWake(() => new MainFlatTarget(), async (api, held) => {
+      held.push(api.files(), await api.avatar(new WriterTarget()));
+    });
+    console.log("[C flat-dup]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+  });
+
+  it("control D — nested+dup but AWAIT persona() first (base resolves to a NEGATIVE export)", async () => {
+    const r = await runWake(() => new MainTarget(), async (api, held) => {
+      const persona = await api.persona(); // AWAIT → persona settles to a negative export
+      held.push(persona, api.files(), await persona.avatar(new WriterTarget()));
+    });
+    console.log("[D await-persona]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+  });
+});
