@@ -23,7 +23,15 @@
       "Bash(Select-Object -First 50)",
       "Bash(xargs grep -l \"sub\\\\|facet\")",
       "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\aicolab\\\\room-service\")",
-      "Bash(pnpm exec *)"
+      "Bash(pnpm exec *)",
+      "Bash(git checkout *)",
+      "Bash(pnpm install *)",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(npm run *)",
+      "Bash(npm install *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
