@@ -22,7 +22,9 @@ import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
          __experimental_hibernatableWebSocketSessionId as __experimental_hibernatableWebSocketSessionIdImpl,
          type HibernatableWebSocketOptions } from "./websocket.js";
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
-         newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
+         newHttpBatchRpcResponse, nodeHttpBatchRpcResponse,
+         type HttpBatchSessionOptions } from "./batch.js";
+import type { Codec } from "./codec/index.js";
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
 import { forceInitMap } from "./map.js";
 import { forceInitStreams } from "./streams.js";
@@ -168,7 +170,8 @@ export interface HibernatableWebSocketSession<T extends RpcCompatible<T> = Empty
  * interface exposed from the peer.
  */
 export let newWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
-    (webSocket: WebSocket | string, localMain?: any, options?: RpcSessionOptions) => RpcStub<T> =
+    (webSocket: WebSocket | string, localMain?: any,
+     options?: RpcSessionOptions & { codec?: Codec }) => RpcStub<T> =
     <any>newWebSocketRpcSessionImpl;
 
 /**
@@ -179,7 +182,7 @@ export let newWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
  * (it will always be set to POST) and the body (which the RPC system will fill in).
  */
 export let newHttpBatchRpcSession:<T extends RpcCompatible<T>>
-    (urlOrRequest: string | Request, options?: RpcSessionOptions) => RpcStub<T> =
+    (urlOrRequest: string | Request, options?: HttpBatchSessionOptions) => RpcStub<T> =
     <any>newHttpBatchRpcSessionImpl;
 
 /**

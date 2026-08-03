@@ -1,5 +1,11 @@
 # capnweb
 
+## 0.10.0-hibernation-cbor.1
+
+### CBOR experiment line
+
+- **Fix: the public typed wrappers in `index.ts` now accept the `codec` option.** `0.10.0-hibernation-cbor.0`'s hand-written public signatures for `newWebSocketRpcSession` and `newHttpBatchRpcSession` still pinned `options` to bare `RpcSessionOptions`, so passing `codec` type-errored even though the runtime accepted it. Types only — no runtime change.
+
 ## 0.10.0-hibernation-cbor.0
 
 ### CBOR experiment line
