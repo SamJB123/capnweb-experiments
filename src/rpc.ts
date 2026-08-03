@@ -23,6 +23,7 @@ import type {
   RpcSessionExportProvenance,
   RpcSessionImportReplay,
   RpcSessionSnapshot,
+  RpcSessionSnapshotPositiveBase,
 } from "./hibernation.js";
 
 /**
@@ -588,6 +589,11 @@ class RpcSessionImpl implements Importer, Exporter {
   private reverseExports: Map<StubHook, ExportId> = new Map();
   private imports: Array<ImportTableEntry> = [];
   private importReplays: RpcSessionImportReplay[] = [];
+  // For every positive (call-result) export referenced as a pipeline base by a replay
+  // expression: the push expression that created it. Kept in a separate map because the export
+  // table entry may be released (peer got its resolution) long before a snapshot is taken, while
+  // the replay still needs the base re-established on restore.
+  private replayBaseExprs: Map<number, unknown> = new Map();
   private abortReason?: any;
   private cancelReadLoop?: (error: any) => void;
 
@@ -664,6 +670,29 @@ class RpcSessionImpl implements Importer, Exporter {
       });
     } catch (_err) {
       // Ignore trace hook failures.
+    }
+  }
+
+  // For a newly-recorded replay, remember how to re-create every positive (call-result) export
+  // its expression references — transitively, since a base's own source expression may itself
+  // pipeline off an earlier call result. Positive exports are dropped from snapshots (they're
+  // normally transient), so a replay that pipelines off one needs the base's originating
+  // expression re-evaluated on restore before the replay can run.
+  private recordReplayBaseExprs(expr: unknown) {
+    let ids = new Set<number>();
+    collectPositiveExportBaseIds(expr, ids);
+    for (let id of ids) {
+      if (this.replayBaseExprs.has(id)) continue;
+      let src = this.exports[id]?.sourceExpr;
+      if (src === undefined) {
+        // No originating expression (e.g. a pipe export) — the base can't be re-established on
+        // restore. Leave a trace; the replay will fail on wake exactly as it did before this
+        // mechanism existed.
+        this.trace("recordReplayBaseExprs.unrestorable", { exportId: id });
+        continue;
+      }
+      this.replayBaseExprs.set(id, src);
+      this.recordReplayBaseExprs(src);
     }
   }
 
@@ -980,12 +1009,27 @@ class RpcSessionImpl implements Importer, Exporter {
       });
     }
 
+    // Positive call-result exports that replay expressions pipeline off. Serialized in ascending
+    // id order (= original creation order), so a chained base can reference an earlier one.
+    const positiveBases = [...this.replayBaseExprs.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([id, expr]): RpcSessionSnapshotPositiveBase => {
+          let entry = this.exports[id];
+          return {
+            id,
+            refcount: entry?.refcount ?? 0,
+            expr,
+            ...(entry?.pull ? { pulling: true } : {}),
+          };
+        });
+
     return {
       version: 2,
       nextExportId: this.nextExportId,
       exports,
       ...(imports.length > 0 ? {imports} : {}),
       ...(this.importReplays.length > 0 ? { importReplays: this.importReplays } : {}),
+      ...(positiveBases.length > 0 ? { positiveBases } : {}),
     };
   }
 
@@ -1320,6 +1364,9 @@ class RpcSessionImpl implements Importer, Exporter {
               if (containsImportedCapabilityReference(msg[2])) {
                 replayRecord = { expr: sourceExpr };
                 this.importReplays.push(replayRecord);
+                // If this capturing call pipelines off transient call results, remember how to
+                // re-create those bases on restore.
+                this.recordReplayBaseExprs(sourceExpr);
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
                   replayCount: this.importReplays.length,
@@ -1561,7 +1608,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (!entry.hook) {
       if (entry.provenance) {
-        const base = new PayloadStubHook(new Evaluator(this).evaluate(cloneRpcExpr(entry.provenance.expr)));
+        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(entry.provenance.expr)));
         try {
           entry.hook = this.deriveExportHookFromBase(entry.provenance, base);
         } finally {
@@ -1623,6 +1670,35 @@ class RpcSessionImpl implements Importer, Exporter {
       }
     }
 
+    // Re-establish positive (call-result) exports that replay expressions pipeline off. These
+    // were transient at snapshot time; re-evaluating their originating push expressions (in
+    // ascending id order, so chained bases resolve) re-creates the entries the replays below
+    // need. Bases the peer had already released (refcount 0) exist only for the replays' sake
+    // and are torn down again once the replays have run.
+    const transientBases: ExportId[] = [];
+    if (snapshot.positiveBases && snapshot.positiveBases.length > 0) {
+      for (let base of [...snapshot.positiveBases].sort((a, b) => a.id - b.id)) {
+        const expr = cloneRpcExpr(base.expr);
+        this.replayBaseExprs.set(base.id, expr);  // keep restorable across the NEXT hibernation
+        if (this.exports[base.id]) continue;
+        this.trace("restoreFromSnapshot.positiveBase", {
+          exportId: base.id,
+          refcount: base.refcount,
+          pulling: !!base.pulling,
+        });
+        const payload = this.evaluateWithCurrentProvenance(cloneRpcExpr(base.expr));
+        const hook = new PayloadStubHook(payload);
+        hook.ignoreUnhandledRejections();
+        this.exports[base.id] = { hook, refcount: base.refcount, sourceExpr: expr };
+        this.reverseExports.set(hook, base.id);
+        if (base.refcount <= 0) {
+          transientBases.push(base.id);
+        } else if (base.pulling) {
+          pendingPulls.push(base.id);
+        }
+      }
+    }
+
     if (snapshot.importReplays && snapshot.importReplays.length > 0) {
       this.importReplays = snapshot.importReplays.map(cloneImportReplay);
       for (let replay of this.importReplays) {
@@ -1637,7 +1713,7 @@ class RpcSessionImpl implements Importer, Exporter {
         // each via its own export provenance — instead of disposing it. Disposing
         // would run the returned capabilities' disposers and undo the very side
         // effect this replay just re-established.
-        const base = new PayloadStubHook(new Evaluator(this).evaluate(cloneRpcExpr(replay.expr)));
+        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(replay.expr)));
         try {
           for (const producesExportId of producesExportIds) {
             const entry = this.exports[producesExportId];
@@ -1659,6 +1735,19 @@ class RpcSessionImpl implements Importer, Exporter {
       }
     }
 
+    // Peer-released bases only existed for the replays above; drop them again. This mirrors the
+    // disposal that happened in the original session when the peer sent its release.
+    for (let id of transientBases) {
+      let entry = this.exports[id];
+      if (!entry) continue;
+      delete this.exports[id];
+      if (entry.hook) {
+        this.reverseExports.delete(entry.hook);
+        entry.hook.dispose();
+      }
+      this.trace("restoreFromSnapshot.positiveBase.release", { exportId: id });
+    }
+
     if (pendingPulls.length > 0) {
       queueMicrotask(() => {
         for (let id of pendingPulls) {
@@ -1674,6 +1763,27 @@ class RpcSessionImpl implements Importer, Exporter {
       throw new Error(`no such import ID: ${importId}`);
     }
     return new RpcStub(new RpcImportHook(false, entry));
+  }
+}
+
+// Collects the ids of positive (call-result) exports that `value` references as pipeline /
+// import / remap bases. Those entries must exist on the exports table for the expression to be
+// re-evaluated on restore. (Negative bases are durable exports, snapshotted with provenance;
+// id 0 is the bootstrap, always present.)
+function collectPositiveExportBaseIds(value: unknown, out: Set<number>): void {
+  if (value instanceof Array) {
+    if (value.length >= 2 &&
+        (value[0] === "pipeline" || value[0] === "import" || value[0] === "remap") &&
+        typeof value[1] === "number" && value[1] > 0) {
+      out.add(value[1]);
+    }
+    for (let nested of value) {
+      collectPositiveExportBaseIds(nested, out);
+    }
+  } else if (value && typeof value === "object") {
+    for (let nested of Object.values(value as Record<string, unknown>)) {
+      collectPositiveExportBaseIds(nested, out);
+    }
   }
 }
 

@@ -55,6 +55,25 @@ export type RpcSessionSnapshotImport = {
   remoteRefcount: number;
 };
 
+/**
+ * A positive (call-result) export that an importReplay's expression references as a pipeline
+ * base. Positive exports are normally transient and dropped from snapshots, but a replay such as
+ * `["pipeline", <positive id>, ["avatar"], [writer]]` cannot be re-evaluated on restore unless
+ * its base exists on the exports table. `expr` is the original push expression that created the
+ * call result; restore re-evaluates it (in ascending id order, so chained bases work) to
+ * re-establish the entry before replays run.
+ */
+export type RpcSessionSnapshotPositiveBase = {
+  id: number;
+  /** Peer-held refcount at snapshot time. 0 means the peer had already released the export;
+   *  restore then re-creates it only for the duration of replay evaluation. */
+  refcount: number;
+  expr: unknown;
+  /** If true, the peer was still awaiting this call's resolution at snapshot time; restore
+   *  re-triggers the pull so the peer receives its resolve/reject. */
+  pulling?: boolean;
+};
+
 export type RpcSessionSnapshot = {
   version: 1 | 2;
   nextExportId: number;
@@ -67,6 +86,9 @@ export type RpcSessionSnapshot = {
    *  application state. Replaying these after restore rebuilds app-held
    *  references without requiring application-layer persistence. */
   importReplays?: RpcSessionImportReplay[];
+  /** Positive call-result exports referenced (transitively) as pipeline bases by
+   *  `importReplays` expressions. Restored before the replays are evaluated. */
+  positiveBases?: RpcSessionSnapshotPositiveBase[];
 };
 
 export type HibernatableSnapshotStorageMode = "inline" | "sessionStore";

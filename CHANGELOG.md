@@ -6,6 +6,8 @@
 
 - **Merged upstream capnweb 0.10.0** (from 0.8.x base). Notable upstream additions now in the fork: transport encoding levels (`EncodingLevel`, generic `WebSocketTransport<T>`), configurable receiver-side resource limits (`RpcSessionOptions.limits`), error-deserialization hardening, and WebSocket close-reason truncation. All hibernation functionality is preserved on top; see the upstream 0.9.0–0.10.0 entries below for details.
 
+- **Fixed: capturing calls pipelined off a call result now survive a hibernation wake.** Previously, a replay-recorded call whose base was a *positive* (transient call-result) export — e.g. `cap.persona().avatar(writer)` without awaiting `persona()` — failed on restore with `no such entry on exports table`, closing the socket `1011 "stale session"`, because positive exports are (correctly) dropped from snapshots while the replay expression still referenced one. Snapshots now carry `positiveBases`: for each positive pipeline base a replay references (transitively, deduplicated — recorded only for capturing calls, so there is no broad capture of positive exports), the base's own originating push expression. Restore re-evaluates these in ascending id order before replays run; peer-released bases are re-created only for the duration of replay evaluation and disposed after, and bases with an in-flight pull have the pull re-triggered. The previously-red REPRO stress test in `__tests__/hibernation-persistence.test.ts` is green (and its timing-sensitive control B can no longer fail from this cause).
+
 ## 0.8.0-hibernation.3
 
 ### Hibernation fork

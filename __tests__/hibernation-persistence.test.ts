@@ -805,7 +805,7 @@ describe("__experimental_newWebCryptoSnapshotSecurity", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DIAGNOSED BUG — to be fixed in capnweb. Read this before touching the fix.
+// BUG — FIXED via snapshot `positiveBases` (see below). Diagnosis kept for history.
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // SYMPTOM (production): the user-hub Durable Object closes the WebSocket with
@@ -835,10 +835,10 @@ describe("__experimental_newWebCryptoSnapshotSecurity", () => {
 // exercise a capturing call whose base is a pipelined positive export, which is
 // exactly the gap.
 //
-// CONTROLS BELOW pin the cause:
-//   REPRO (nested persona().avatar(writer), capturing)  → FAILS  (positive base dropped)
+// CONTROLS BELOW pinned the cause (pre-fix outcomes shown; all are green now):
+//   REPRO (nested persona().avatar(writer), capturing)  → FAILED (positive base dropped)
 //   A (hold persona+files only, no stream)               → OK     (no importReplay at all)
-//   B (nested stream, NO dup)                             → FAILS  (dup is NOT the cause —
+//   B (nested stream, NO dup)                             → FAILED (dup is NOT the cause —
 //                                                                   the writer is still an arg, so the
 //                                                                   importReplay + positive base still exist;
 //                                                                   dup only shifts timing)
@@ -853,14 +853,18 @@ describe("__experimental_newWebCryptoSnapshotSecurity", () => {
 // REPRO deterministically green and consider isolating/closing sessions between
 // tests to remove the race.
 //
-// THE FIX (capnweb, proper): when a pipelined-promise base (a positive
-// call-result export) RESOLVES to a durable negative export, rewrite the
-// importReplay's base reference from the transient positive id to that resolved
-// negative id — which IS serialized, with its own provenance (e.g. persona's
-// negative export carries `main.persona()` provenance). Do it either at resolve
-// time (`ensureResolvingExport`) or by resolving positive references at snapshot
-// time (`__experimental_snapshot`). Must not regress the security / nested-return
-// suites above.
+// THE FIX (implemented — the "resolve at snapshot time" variant): when a replay
+// is recorded, every positive pipeline base its expression references is noted
+// in `replayBaseExprs` (id → the base's own originating push expression,
+// transitively, deduplicated). The snapshot serializes these as
+// `positiveBases`; restore re-evaluates them in ascending id order BEFORE the
+// replays run, re-creating the transient entries the replays pipeline off.
+// Bases the peer had already released (refcount 0) exist only for the duration
+// of replay evaluation and are disposed immediately after; bases with an
+// in-flight pull get the pull re-triggered. This covers both the
+// resolved-before-snapshot and never-resolved cases, with no path bookkeeping.
+// REPRO and control B below are green as a result; the rewrite-at-resolve-time
+// alternative was not needed.
 //
 // APP-SIDE UNBLOCK already shipped: user-hub `await`s `cap.persona()` / `cap.files()`
 // so the stream base is a negative export from the start (control D). That keeps
