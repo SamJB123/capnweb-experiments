@@ -8,6 +8,12 @@ import type { IncomingMessage, ServerResponse, OutgoingHttpHeader, OutgoingHttpH
 
 type SendBatchFunc = (batch: string[]) => Promise<string[]>;
 
+// Yield a full macrotask; prefer setImmediate because Node/Bun clamp setTimeout(0) to 1ms.
+const yieldToMacrotask: () => Promise<void> =
+  typeof setImmediate === "function"
+    ? () => new Promise(resolve => setImmediate(resolve))
+    : () => new Promise(resolve => setTimeout(resolve, 0));
+
 class BatchClientTransport implements RpcTransport {
   constructor(sendBatch: SendBatchFunc) {
     this.#promise = this.#scheduleBatch(sendBatch);
@@ -19,7 +25,7 @@ class BatchClientTransport implements RpcTransport {
   #batchToSend: string[] | null = [];
   #batchToReceive: string[] | null = null;
 
-  async send(message: string): Promise<void> {
+  send(message: string): void {
     // If the batch was already sent, we just ignore the message, because throwing may cause the
     // RPC system to abort prematurely. Once the last receive() is done then we'll throw an error
     // that aborts the RPC system at the right time and will propagate to all other requests.
@@ -55,7 +61,7 @@ class BatchClientTransport implements RpcTransport {
     // promise in order to explicitly indicate they want the results. Unfortunately, `await`ing
     // a thenable does not call `.then()` immediately -- for some reason it waits for a turn of
     // the microtask queue first, *then* calls `.then()`.
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await yieldToMacrotask();
 
     if (this.#aborted !== undefined) {
       throw this.#aborted;
@@ -98,7 +104,7 @@ class BatchServerTransport implements RpcTransport {
   #batchToReceive: string[];
   #allReceived: PromiseWithResolvers<void> = Promise.withResolvers<void>();
 
-  async send(message: string): Promise<void> {
+  send(message: string): void {
     this.#batchToSend.push(message);
   }
 
@@ -178,7 +184,9 @@ export async function nodeHttpBatchRpcResponse(
       headers?: OutgoingHttpHeaders | OutgoingHttpHeader[],
     }): Promise<void> {
   if (request.method !== "POST") {
-    response.writeHead(405, "This endpoint only accepts POST requests.");
+    response.writeHead(405, "This endpoint only accepts POST requests.", options?.headers);
+    response.end();
+    return;
   }
 
   let body = await new Promise<string>((resolve, reject) => {

@@ -29,10 +29,9 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
-          persist-credentials: false
 
       - name: Build prompt with triggering comment
         id: prompt
@@ -66,6 +65,7 @@ jobs:
           variant: "high"
           mentions: "/bonk,@ask-bonk"
           permissions: write
+          token_permissions: NO_PUSH
           agent: bonk
           opencode_version: 1.15.13 # pin to this version as certain ones cause ProviderInitError issues
           prompt: ${{ steps.prompt.outputs.value }}
