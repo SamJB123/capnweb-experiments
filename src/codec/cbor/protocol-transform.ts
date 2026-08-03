@@ -112,8 +112,10 @@ export function ensureProtocolTokenExtension(): void {
  */
 export function toProtocolTokens(value: unknown): unknown {
   // A Uint8Array (raw bytes from a binary codec) is an opaque leaf — never recurse
-  // into it as an object, or it would be shredded into {0:…,1:…}.
-  if (value instanceof Uint8Array) return value;
+  // into it as an object, or it would be shredded into {0:…,1:…}. Likewise a native
+  // Date (present at the "structuredClonable" encoding level) must pass through as a
+  // leaf, or the object walk below would shred it into {}.
+  if (value instanceof Uint8Array || value instanceof Date) return value;
   if (Array.isArray(value)) {
     if (value.length >= 1 && typeof value[0] === "string") {
       const rest = new Array(value.length - 1);
@@ -156,8 +158,8 @@ export function fromProtocolTokens(value: unknown): unknown {
   if (value instanceof ProtocolToken) {
     return [value.head, ...value.rest.map(fromProtocolTokens)];
   }
-  // Raw bytes are an opaque leaf (see toProtocolTokens).
-  if (value instanceof Uint8Array) return value;
+  // Raw bytes and native Dates are opaque leaves (see toProtocolTokens).
+  if (value instanceof Uint8Array || value instanceof Date) return value;
   if (Array.isArray(value)) {
     return value.map(fromProtocolTokens);
   }

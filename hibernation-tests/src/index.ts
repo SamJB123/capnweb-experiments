@@ -1,6 +1,7 @@
 import {
   __experimental_newDurableObjectSessionStore,
   __experimental_newHibernatableWebSocketRpcSession,
+  __experimental_hibernatableWebSocketSessionId,
 } from "../../src/index-workers.ts";
 import {
   RpcTarget,
@@ -255,14 +256,9 @@ export class ChatRoomDo extends DurableObject {
   }
 
   private getRoomSessionId(ws: WebSocket): string | undefined {
-    const raw = (ws as any).deserializeAttachment?.();
-    // capnweb namespaces its data under __capnweb (see persistSnapshot in
-    // src/websocket.ts). Fall back to raw for backwards compatibility.
-    const attachment = raw?.__capnweb ?? raw;
-    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
-      return attachment.sessionId;
-    }
-    return undefined;
+    // Use the library helper: it understands every attachment version capnweb writes
+    // (a hand-rolled version check here went stale when the attachment moved past v1).
+    return __experimental_hibernatableWebSocketSessionId(ws);
   }
 }
 
@@ -617,14 +613,9 @@ export class HibRpcDo extends DurableObject {
   }
 
   private getSessionId(ws: WebSocket): string | undefined {
-    const raw = (ws as any).deserializeAttachment?.();
-    // capnweb namespaces its data under __capnweb (see persistSnapshot in
-    // src/websocket.ts). Fall back to raw for backwards compatibility.
-    const attachment = raw?.__capnweb ?? raw;
-    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
-      return attachment.sessionId;
-    }
-    return undefined;
+    // Use the library helper: it understands every attachment version capnweb writes
+    // (a hand-rolled version check here went stale when the attachment moved past v1).
+    return __experimental_hibernatableWebSocketSessionId(ws);
   }
 
   private pushTrace(
@@ -762,12 +753,9 @@ export class NoStoreHibRpcDo extends DurableObject {
   }
 
   private getSessionId(ws: WebSocket): string | undefined {
-    const raw = (ws as any).deserializeAttachment?.();
-    const attachment = raw?.__capnweb ?? raw;
-    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
-      return attachment.sessionId;
-    }
-    return undefined;
+    // Use the library helper: it understands every attachment version capnweb writes
+    // (a hand-rolled version check here went stale when the attachment moved past v1).
+    return __experimental_hibernatableWebSocketSessionId(ws);
   }
 }
 

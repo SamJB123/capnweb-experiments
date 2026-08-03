@@ -6,6 +6,19 @@ import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import { RpcTargetBranded } from "./types.js";
 import type { ServerWebSocket } from "bun";
+import type { Codec } from "./codec/index.js";
+import { CodecTransport } from "./codec/transport.js";
+
+/** Options accepted by the Bun helpers: session options plus an optional wire codec. */
+export type BunSessionOptions = RpcSessionOptions & {
+  /**
+   * Optional wire codec (e.g. CBOR via `capnweb/codec/cbor`). When set, the layering is
+   * `session → CodecTransport (codec encodes/decodes) → Bun WebSocket transport (raw frames)`.
+   * Both ends of the session must use the same codec and codec options; there is no codec
+   * negotiation in the protocol. Omitted → standard JSON text.
+   */
+  codec?: Codec;
+};
 
 /**
  * Start an RPC session over a Bun ServerWebSocket.
@@ -18,9 +31,15 @@ import type { ServerWebSocket } from "bun";
  */
 export function newBunWebSocketRpcSession<T>(
     ws: ServerWebSocket<T>, localMain?: any,
-    options?: RpcSessionOptions): { stub: RpcStub, transport: BunWebSocketTransport<T> } {
+    options?: BunSessionOptions): { stub: RpcStub, transport: BunWebSocketTransport<T> } {
   let transport = new BunWebSocketTransport<T>(ws);
-  let rpc = new RpcSession(transport, localMain, options);
+  // Without a codec, only text frames ever flow; the transport's wider message type exists for
+  // the codec case, so asserting the string-only RpcTransport shape states a runtime fact.
+  let sessionTransport = options?.codec
+      ? new CodecTransport(transport, options.codec,
+          { maxMessageSize: options.limits?.maxMessageSize })
+      : transport as RpcTransport;
+  let rpc = new RpcSession(sessionTransport, localMain, options);
   return { stub: rpc.getRemoteMain(), transport };
 }
 
@@ -36,11 +55,15 @@ type WsData = { __capnwebTransport: BunWebSocketTransport<WsData>, __capnwebStub
  * @param createMain Called once per connection to create the main RPC interface for that client.
  * @param options Optional RPC session options applied to every connection.
  */
-export function newBunWebSocketRpcHandler(createMain: () => RpcTargetBranded, options?: RpcSessionOptions) {
+export function newBunWebSocketRpcHandler(createMain: () => RpcTargetBranded, options?: BunSessionOptions) {
   return {
     open(ws: ServerWebSocket<WsData>) {
       let transport = new BunWebSocketTransport<WsData>(ws);
-      let rpc = new RpcSession(transport, createMain(), options);
+      let sessionTransport = options?.codec
+          ? new CodecTransport(transport, options.codec,
+              { maxMessageSize: options.limits?.maxMessageSize })
+          : transport as RpcTransport;
+      let rpc = new RpcSession(sessionTransport, createMain(), options);
       ws.data = { __capnwebTransport: transport, __capnwebStub: rpc.getRemoteMain() };
     },
     message(ws: ServerWebSocket<WsData>, message: string | Buffer) {
@@ -55,7 +78,10 @@ export function newBunWebSocketRpcHandler(createMain: () => RpcTargetBranded, op
   };
 }
 
-export class BunWebSocketTransport<T = undefined> implements RpcTransport {
+// Carries `string | Uint8Array` frames (binary for codec sessions), so it is intentionally wider
+// than `RpcTransport` and doesn't declare `implements`. Codec-less sessions assert the
+// string-only shape at the construction sites above.
+export class BunWebSocketTransport<T = undefined> {
   constructor (ws: ServerWebSocket<T>) {
     this.#ws = ws;
   }

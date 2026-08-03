@@ -32,6 +32,16 @@ export interface Codec {
    */
   readonly binary?: boolean;
 
+  /**
+   * OPTIONAL. The transport encoding level this codec consumes (see
+   * `RpcTransportWithCustomEncoding.encodingLevel`). When unset, the codec
+   * transport derives it from `binary`: "jsonCompatibleWithBytes" for binary
+   * codecs, "jsonCompatible" otherwise. A codec that round-trips native Date /
+   * BigInt / undefined / non-finite numbers (e.g. CBOR with `structuredClone`)
+   * may declare "structuredClonable" to skip tokenizing those values entirely.
+   */
+  readonly encodingLevel?: "jsonCompatible" | "jsonCompatibleWithBytes" | "structuredClonable";
+
   /** Encode a devalued message for the wire. */
   encode(message: unknown): string | Uint8Array;
 

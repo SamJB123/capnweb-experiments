@@ -39,6 +39,16 @@ export interface CborCodecOptions {
    * overhead. Default `false`.
    */
   optimizeEnvelope?: boolean;
+
+  /**
+   * Consume capnweb's "structuredClonable" encoding level instead of
+   * "jsonCompatibleWithBytes": Date, BigInt, undefined and non-finite numbers skip capnweb's
+   * string tokenization and encode as native CBOR values (smaller and faster), and cbor-x's
+   * `structuredClone` extensions are enabled (adding object-identity preservation for repeated
+   * references). This CHANGES THE WIRE FORMAT — both ends must agree on this option, like all
+   * codec options. Default `false` (wire format identical to previous releases).
+   */
+  structuredClone?: boolean;
 }
 
 function decodeGuard(wire: string | Uint8Array): Uint8Array {
@@ -115,16 +125,25 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
   if (optimize) ensureProtocolTokenExtension();
   const prep = optimize ? toProtocolTokens : (m: unknown) => m;
   const post = optimize ? fromProtocolTokens : (m: unknown) => m;
-  const protoSuffix = optimize ? "-proto" : "";
+  // Both options change the wire format, so both are reflected in the codec id (which guards
+  // hibernation snapshot restore against a codec/options mismatch).
+  const sc = !!options.structuredClone;
+  const idSuffix = (sc ? "-sc" : "") + (optimize ? "-proto" : "");
+  // At "structuredClonable" level the session hands us native Date/BigInt/undefined/±Infinity
+  // values instead of their tokenized forms; cbor-x encodes all of those natively. The
+  // structuredClone extensions additionally preserve object identity for repeated references.
+  const encodingLevel = sc ? "structuredClonable" as const : "jsonCompatibleWithBytes" as const;
+  const scOpts = sc ? { structuredClone: true } : {};
 
   if (!options.stateful) {
     // Stateless: a single Encoder instance both encodes and decodes; no shared
     // structure table, so each message stands alone. tagUint8Array:false → byte
     // arrays encode as bare CBOR byte strings (no extra tag).
-    const encoder = new Encoder({ useRecords: false, tagUint8Array: false });
+    const encoder = new Encoder({ useRecords: false, tagUint8Array: false, ...scOpts });
     return {
-      id: "cbor" + protoSuffix,
+      id: "cbor" + idSuffix,
       binary: true,
+      encodingLevel,
       encode(message: unknown): Uint8Array {
         return encoder.encode(prep(message));
       },
@@ -137,14 +156,15 @@ export function createCborCodec(options: CborCodecOptions = {}): Codec {
   // Stateful: separate encoder/decoder instances so the two directions keep
   // independent structure tables. Only the decoder is given a structures array
   // (which cbor-x populates as it learns); that array is what we snapshot.
-  const SEQ = { useRecords: true, sequential: true, tagUint8Array: false } as const;
+  const SEQ = { useRecords: true, sequential: true, tagUint8Array: false, ...scOpts } as const;
   let decoderStructures: object[] = [];
   let encoder = new Encoder({ ...SEQ });
   let decoder = new Decoder({ ...SEQ, structures: decoderStructures });
 
   return {
-    id: "cbor-sequential" + protoSuffix,
+    id: "cbor-sequential" + idSuffix,
     binary: true,
+    encodingLevel,
 
     encode(message: unknown): Uint8Array {
       return encoder.encode(prep(message));

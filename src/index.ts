@@ -8,13 +8,14 @@ import {
   RpcPromise as RpcPromiseImpl,
   __experimental_debugRpcReference as __experimental_debugRpcReferenceImpl,
 } from "./core.js";
-import { serialize, deserialize } from "./serialize.js";
-import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
+import { serialize, deserialize, EncodingLevel } from "./serialize.js";
+import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
+import { RpcLimits, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH } from "./serialize.js";
 import type { RpcSessionDebugState } from "./rpc.js";
 import type { HibernatableSessionStore, RpcSessionSnapshot } from "./hibernation.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
 import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
-         newWorkersWebSocketRpcResponse,
+         newWorkersWebSocketRpcResponse, WebSocketTransport,
          __experimental_newHibernatableWebSocketRpcSession as __experimental_newHibernatableWebSocketRpcSessionImpl,
          __experimental_resumeHibernatableWebSocketRpcSession as __experimental_resumeHibernatableWebSocketRpcSessionImpl,
          __experimental_cleanupOrphanedSessions as __experimental_cleanupOrphanedSessionsImpl,
@@ -31,11 +32,17 @@ forceInitStreams();
 
 // Re-export public API types.
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
-         nodeHttpBatchRpcResponse };
+         nodeHttpBatchRpcResponse, WebSocketTransport, DEFAULT_LIMITS, DEFAULT_MAX_DEPTH };
+export { jsonCodec } from "./codec/index.js";
+export type { Codec } from "./codec/index.js";
+export { CodecTransport } from "./codec/transport.js";
+export type { CodecTransportInner, CodecTransportOptions } from "./codec/transport.js";
+export type { HttpBatchSessionOptions } from "./batch.js";
 export { __experimental_newDurableObjectSessionStore } from "./hibernation.js";
 export { __experimental_newWebCryptoSnapshotSecurity } from "./snapshot-security.js";
 export type { WebCryptoSnapshotSecurityOptions } from "./snapshot-security.js";
-export type { RpcTransport, RpcSessionOptions, RpcCompatible };
+export type { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport,
+         RpcSessionOptions, RpcCompatible, EncodingLevel, RpcLimits };
 export type {
   HibernatableEncryptedSnapshotEnvelope,
   HibernatableSnapshotSecurity,
@@ -112,7 +119,7 @@ export interface RpcSession<T extends RpcCompatible<T> = undefined> {
 }
 export const RpcSession: {
   new <T extends RpcCompatible<T> = undefined>(
-      transport: RpcTransport, localMain?: any, options?: RpcSessionOptions): RpcSession<T>;
+      transport: AnyRpcTransport, localMain?: any, options?: RpcSessionOptions): RpcSession<T>;
 } = <any>RpcSessionImpl;
 
 // RpcTarget needs some hackage too to brand it properly and account for the implementation
@@ -215,9 +222,10 @@ export const __experimental_debugRpcReference:
  * credentials as parameters and returns the authorized API), then cross-origin requests should
  * be safe.
  */
-export async function newWorkersRpcResponse(request: Request, localMain: any) {
+export async function newWorkersRpcResponse(
+    request: Request, localMain: any, options?: RpcSessionOptions) {
   if (request.method === "POST") {
-    let response = await newHttpBatchRpcResponse(request, localMain);
+    let response = await newHttpBatchRpcResponse(request, localMain, options);
     // Since we're exposing the same API over WebSocket, too, and WebSocket always allows
     // cross-origin requests, the API necessarily must be safe for cross-origin use (e.g. because
     // it uses in-band authorization, as recommended in the readme). So, we might as well allow
@@ -225,7 +233,7 @@ export async function newWorkersRpcResponse(request: Request, localMain: any) {
     response.headers.set("Access-Control-Allow-Origin", "*");
     return response;
   } else if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-    return newWorkersWebSocketRpcResponse(request, localMain);
+    return newWorkersWebSocketRpcResponse(request, localMain, options);
   } else {
     return new Response("This endpoint only accepts POST or WebSocket requests.", { status: 400 });
   }

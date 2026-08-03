@@ -4,9 +4,16 @@
 
 import { expect, it, describe } from "vitest";
 import { Encoder, Tag } from "cbor-x";
-import { RpcSession, RpcTarget, type RpcTransport } from "../src/index.js";
+import { RpcSession, RpcTarget, type RpcTransport, type AnyRpcTransport } from "../src/index.js";
+import { CodecTransport, type CodecTransportInner } from "../src/codec/transport.js";
 import { createCborCodec } from "../src/codec/cbor/index.js";
 import { jsonCodec, type Codec } from "../src/codec/index.js";
+
+/** Plan-B layering: with a codec, the session talks to a CodecTransport wrapping the raw pipe.
+ *  Without one, the raw pipe speaks JSON text directly (asserting the string-only shape). */
+function withCodec(transport: CodecTransportInner, codec?: Codec): AnyRpcTransport {
+  return codec ? new CodecTransport(transport, codec) : (transport as RpcTransport);
+}
 
 // ---------------------------------------------------------------------------
 // Codec-level round-trip: encode then decode must reproduce the devalued message.
@@ -112,8 +119,8 @@ describe("CBOR codec over an RPC session", () => {
     const codec = createCborCodec();
     const [clientTransport, serverTransport] = makePair();
 
-    const server = new RpcSession(serverTransport, new TestApi(), { codec });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec });
+    const server = new RpcSession(withCodec(serverTransport, codec), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, codec));
     using stub = client.getRemoteMain();
 
     expect(await stub.add(2, 3)).toBe(5);
@@ -136,8 +143,8 @@ describe("CBOR codec over an RPC session", () => {
       async getApi() { return new TestApi(); }
     }
 
-    const server = new RpcSession(serverTransport, new Pipelined(), { codec });
-    const client = new RpcSession<Pipelined>(clientTransport, undefined, { codec });
+    const server = new RpcSession(withCodec(serverTransport, codec), new Pipelined());
+    const client = new RpcSession<Pipelined>(withCodec(clientTransport, codec));
     using stub = client.getRemoteMain();
 
     // Pipeline a call on the result of a call without awaiting in between.
@@ -179,8 +186,8 @@ describe("codec state survives the session snapshot (mechanism)", () => {
   it("captures stateful codec state at version 3 and restores it on a new session", async () => {
     const serverCodec = new CountingCodec();
     const [clientTransport, serverTransport] = makePair();
-    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: new CountingCodec() });
+    const server = new RpcSession(withCodec(serverTransport, serverCodec), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, new CountingCodec()));
     using stub = client.getRemoteMain();
 
     // Drive some traffic so the server codec accumulates state.
@@ -195,8 +202,7 @@ describe("codec state survives the session snapshot (mechanism)", () => {
     // Simulate hibernation: rebuild the server from the snapshot with a fresh codec instance.
     const resumedCodec = new CountingCodec();
     const [, serverTransport2] = makePair();
-    const resumed = new RpcSession(serverTransport2, new TestApi(), {
-      codec: resumedCodec,
+    const resumed = new RpcSession(withCodec(serverTransport2, resumedCodec), new TestApi(), {
       __experimental_restoreSnapshot: snap,
     });
 
@@ -228,8 +234,7 @@ describe("codec state survives the session snapshot (mechanism)", () => {
       codec: { id: "counting", state: { encodeCount: 5 } },
     };
     // Resume with a DIFFERENT codec id -> must throw.
-    expect(() => new RpcSession(serverTransport, new TestApi(), {
-      codec: createCborCodec(),
+    expect(() => new RpcSession(withCodec(serverTransport, createCborCodec()), new TestApi(), {
       __experimental_restoreSnapshot: snap,
     })).toThrow(/codec mismatch/);
   });
@@ -248,8 +253,8 @@ describe("stateful CBOR codec (sequential mode)", () => {
 
   it("makes calls end-to-end in sequential mode (repeated shapes included)", async () => {
     const [clientTransport, serverTransport] = makePair();
-    const server = new RpcSession(serverTransport, new TestApi(), { codec: createCborCodec({ stateful: true }) });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: createCborCodec({ stateful: true }) });
+    const server = new RpcSession(withCodec(serverTransport, createCborCodec({ stateful: true })), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, createCborCodec({ stateful: true })));
     using stub = client.getRemoteMain();
 
     expect(await stub.add(2, 3)).toBe(5);
@@ -305,8 +310,8 @@ describe("stateful CBOR codec (sequential mode)", () => {
   it("a stateful session captures codec structures in its snapshot (4a + 4b)", async () => {
     const serverCodec = createCborCodec({ stateful: true });
     const [clientTransport, serverTransport] = makePair();
-    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: createCborCodec({ stateful: true }) });
+    const server = new RpcSession(withCodec(serverTransport, serverCodec), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, createCborCodec({ stateful: true })));
     using stub = client.getRemoteMain();
     // Pass object-shaped args so cbor-x forms record structures (the protocol
     // envelope itself is array-based and produces none). The server's decoder
@@ -412,8 +417,8 @@ describe("envelope optimization (array→object via private CBOR tag)", () => {
   // --- end-to-end over a real session, including a token-shaped object arg ---
   it("works end-to-end over an RPC session", async () => {
     const [clientTransport, serverTransport] = makePair();
-    const server = new RpcSession(serverTransport, new TestApi(), { codec: mk() });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: mk() });
+    const server = new RpcSession(withCodec(serverTransport, mk()), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, mk()));
     using stub = client.getRemoteMain();
 
     expect(await stub.add(2, 3)).toBe(5);
@@ -427,14 +432,74 @@ describe("envelope optimization (array→object via private CBOR tag)", () => {
   it("snapshots codec state with envelope optimization (id reflects the mode)", async () => {
     const serverCodec = mk();
     const [clientTransport, serverTransport] = makePair();
-    const server = new RpcSession(serverTransport, new TestApi(), { codec: serverCodec });
-    const client = new RpcSession<TestApi>(clientTransport, undefined, { codec: mk() });
+    const server = new RpcSession(withCodec(serverTransport, serverCodec), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, mk()));
     using stub = client.getRemoteMain();
     await stub.echo({ a: 1, b: 2 });
 
     const snap = server.__experimental_snapshot();
     expect(snap.version).toBe(3);
     expect(snap.codec?.id).toBe("cbor-sequential-proto");
+    void server;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// structuredClone mode: the codec consumes capnweb's "structuredClonable"
+// encoding level, so Date/BigInt/undefined/non-finite numbers skip tokenization
+// and ride as native CBOR values.
+// ---------------------------------------------------------------------------
+
+describe("structuredClone mode (native values at structuredClonable level)", () => {
+  it("changes the codec id (snapshot guard catches an options mismatch)", () => {
+    expect(createCborCodec({ structuredClone: true }).id).toBe("cbor-sc");
+    expect(createCborCodec({ stateful: true, structuredClone: true }).id).toBe("cbor-sequential-sc");
+    expect(createCborCodec({ stateful: true, structuredClone: true, optimizeEnvelope: true }).id)
+        .toBe("cbor-sequential-sc-proto");
+  });
+
+  it("declares the structuredClonable encoding level (jsonCompatibleWithBytes otherwise)", () => {
+    expect(createCborCodec().encodingLevel).toBe("jsonCompatibleWithBytes");
+    expect(createCborCodec({ stateful: true }).encodingLevel).toBe("jsonCompatibleWithBytes");
+    expect(createCborCodec({ structuredClone: true }).encodingLevel).toBe("structuredClonable");
+    expect(new CodecTransport(makePair()[0], createCborCodec({ structuredClone: true })).encodingLevel)
+        .toBe("structuredClonable");
+  });
+
+  it("round-trips native Date, BigInt, undefined and non-finite numbers end-to-end", async () => {
+    const mk = () => createCborCodec({ structuredClone: true });
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(withCodec(serverTransport, mk()), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, mk()));
+    using stub = client.getRemoteMain();
+
+    const date = new Date("2026-01-02T03:04:05.678Z");
+    expect(await stub.echo(date)).toEqual(date);
+    expect(await stub.echo(123456789123456789n)).toBe(123456789123456789n);
+    expect(await stub.echo({ big: -(2n ** 100n) })).toEqual({ big: -(2n ** 100n) });
+    expect(await stub.echo(undefined)).toBeUndefined();
+    expect(await stub.echo([Infinity, -Infinity])).toEqual([Infinity, -Infinity]);
+    expect(Number.isNaN(await stub.echo(NaN))).toBe(true);
+    // Raw bytes keep working at this level too.
+    const bytes = new Uint8Array([1, 2, 3, 255]);
+    expect(Array.from(await stub.echo(bytes) as Uint8Array)).toEqual([1, 2, 3, 255]);
+    // The frames really were binary CBOR.
+    expect(clientTransport.sawBinary).toBe(true);
+    void server;
+  });
+
+  it("envelope optimization passes native Dates through as leaves (not shredded)", async () => {
+    const mk = () => createCborCodec({ stateful: true, structuredClone: true, optimizeEnvelope: true });
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(withCodec(serverTransport, mk()), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(clientTransport, mk()));
+    using stub = client.getRemoteMain();
+
+    const date = new Date("2026-06-07T08:09:10.111Z");
+    const result = await stub.echo({ when: date, tag: "x", nested: [date] }) as
+        { when: Date, tag: string, nested: Date[] };
+    expect(result.when).toEqual(date);
+    expect(result.nested[0]).toEqual(date);
     void server;
   });
 });
@@ -676,9 +741,8 @@ describe("native bytes — raw on binary codecs, base64 on JSON (no accidental l
   // Echo `bytes` through a session pair; return the result + the client's sent frames.
   async function echoBytes(codec: Codec | undefined, bytes: Uint8Array) {
     const [ct, st] = capPair();
-    const opts = codec ? { codec } : {};
-    const server = new RpcSession(st, new TestApi(), opts);
-    const client = new RpcSession<TestApi>(ct, undefined, opts);
+    const server = new RpcSession(withCodec(st, codec), new TestApi());
+    const client = new RpcSession<TestApi>(withCodec(ct, codec));
     using stub = client.getRemoteMain();
     const result = await stub.echo(bytes);
     void server;
@@ -884,13 +948,12 @@ function reconnect(clientT: PairTransport): PairTransport {
 }
 
 type CodecFactory = () => Codec | undefined;
-const codecOpt = (codec: Codec | undefined) => (codec ? { codec } : {});
 
 /** A connected Hub session pair under the given codec (undefined → default JSON). */
 function makeHubPair(mk: CodecFactory) {
   const [clientT, serverT] = makePair();
-  const client = new RpcSession<HubApi>(clientT, undefined, codecOpt(mk()));
-  const server = new RpcSession(serverT, new Hub(), codecOpt(mk()));
+  const client = new RpcSession<HubApi>(withCodec(clientT, mk()));
+  const server = new RpcSession(withCodec(serverT, mk()), new Hub());
   return { clientT, serverT, client, server, stub: client.getRemoteMain() };
 }
 
@@ -900,7 +963,7 @@ function makeHubPair(mk: CodecFactory) {
 function wakeServer(clientT: PairTransport, server: RpcSession, mk: CodecFactory): RpcSession {
   const snap = JSON.parse(JSON.stringify(server.__experimental_snapshot()));
   const serverT2 = reconnect(clientT);
-  return new RpcSession(serverT2, new Hub(), { ...codecOpt(mk()), __experimental_restoreSnapshot: snap });
+  return new RpcSession(withCodec(serverT2, mk()), new Hub(), { __experimental_restoreSnapshot: snap });
 }
 
 /** Codec configs every core scenario runs under: `[name, factory, expectsBinary]`. */
@@ -909,6 +972,7 @@ const codecMatrix: ReadonlyArray<readonly [string, CodecFactory, boolean]> = [
   ["stateless CBOR", () => createCborCodec(), true],
   ["stateful CBOR", () => createCborCodec({ stateful: true }), true],
   ["stateful CBOR + optimizeEnvelope", () => createCborCodec({ stateful: true, optimizeEnvelope: true }), true],
+  ["stateful CBOR + structuredClone", () => createCborCodec({ stateful: true, structuredClone: true }), true],
 ];
 
 describe("importReplay rebind across hibernation (codec matrix)", () => {

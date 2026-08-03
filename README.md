@@ -201,7 +201,7 @@ The following types can be passed over RPC (in arguments or return values), and 
 * Arrays
 * `bigint`
 * `Date`
-* `Uint8Array`
+* `ArrayBuffer`, `DataView`, and typed arrays
 * `Error` and its well-known subclasses
 * `Blob`
 * `ReadableStream` and `WritableStream`, with automatic flow control.
@@ -209,7 +209,6 @@ The following types can be passed over RPC (in arguments or return values), and 
 
 The following types are not supported as of this writing, but may be added in the future:
 * `Map` and `Set`
-* `ArrayBuffer` and typed arrays other than `Uint8Array`
 * `RegExp`
 
 The following are intentionally NOT supported:
@@ -381,6 +380,40 @@ Sometimes you need to pass a stub somewhere where it will be disposed, but also 
 
 Hint: You can call `.dup()` on a property of a stub or promise, in order to create a stub backed by that property. This is particularly useful when you know in advance that the property is going to resolve to a stub: calling `.dup()` on it gives you a stub you can start using immediately, that otherwise behaves exactly the same as the eventual stub would if you awaited it.
 
+#### Holding on to a callback past the call that delivered it
+
+A common bidirectional-calling pattern is for the client to pass a callback to the server, which the server then invokes later (for example from a timer, an event handler, or a subsequent RPC). Because the callback parameter is a stub, and stubs in params are implicitly disposed when the call returns, the server must duplicate the stub with `.dup()` if it wants to invoke the callback after the call completes:
+
+```ts
+import { type RpcStub, RpcTarget } from 'capnweb';
+
+// A callback the client passes in: a stub wrapping a function.
+type Listener = RpcStub<(msg: string) => void>;
+
+class Api extends RpcTarget {
+  #listener?: Listener;
+
+  // Stubs passed as params are disposed when the call returns, so `.dup()`
+  // to keep a reference that outlives registerListener().
+  registerListener(listener: Listener) {
+    this.#listener?.[Symbol.dispose]();   // release any previous listener
+    this.#listener = listener.dup();
+  }
+
+  // A *later* call can invoke the retained callback -- still valid thanks to .dup().
+  notify(msg: string) {
+    this.#listener?.(msg);
+  }
+
+  // Dispose our duplicate when done so the client-side stub can be freed.
+  [Symbol.dispose]() {
+    this.#listener?.[Symbol.dispose]();
+  }
+}
+```
+
+The same rule applies in the other direction: if the server returns a stub to the client and the client wants to keep using it after disposing the result, the client should `.dup()` the stub before the result is disposed.
+
 ### Listening for disposal
 
 An `RpcTarget` may declare a `Symbol.dispose` method. If it does, the RPC system will automatically invoke it when a stub pointing at it (and all its duplicates) has been disposed.
@@ -406,6 +439,8 @@ If anything happens to the stub that would cause all further method calls and pr
 * The WebSocket API in browsers always permits cross-site connections, and does not permit setting headers. Because of this, you generally cannot use cookies nor other headers for authentication. Instead, we highly recommend the pattern shown in the second example above, in which authentication happens in-band via an RPC method that returns the authenticated API.
 
 * Cap'n Web's pipelining can make it easy for a malicious client to enqueue a large amount of work to occur on a server. To mitigate this, we recommend implementing rate limits on expensive operations. If using Cloudflare Workers, you may also consider configuring [per-request CPU limits](https://developers.cloudflare.com/workers/wrangler/configuration/#limits) to be lower than the default 30s. Note that in stateless Workers (i.e. not Durable Objects), the system considers an entire WebSocket session to be one "request" for CPU limits purposes.
+
+* Cap'n Web applies receiver-side resource limits before expensive message processing, including a maximum incoming message size before `JSON.parse`. If your app is exposed to untrusted peers, also configure native transport or socket payload limits where available, such as `ws`'s `maxPayload`, Bun's `maxPayloadLength`, or the runtime's built-in WebSocket cap. Cap'n Web's own check runs after `RpcTransport.receive()` has returned a complete message string, so transport-level limits are still the first line of defense against buffering very large frames.
 
 * Cap'n Web currently does not provide any runtime type checking. When using TypeScript, keep in mind that types are checked only at compile time. A malicious client can send types you did not expect, and this could cause you application to behave in unexpected ways. For example, MongoDB uses special property names to express queries; placing attacker-provided values directly into queries can result in query injection vulnerabilities (similar to SQL injection). Of course, JSON has always had the same problem, and there exists tooling to solve it. You might consider using a runtime type-checking framework like Zod to check your inputs. In the future, we hope to explore auto-generating type-checking code based on TypeScript types.
 
@@ -778,3 +813,10 @@ let stub: RemoteMainInterface = session.getRemoteMain();
 ```
 
 Note that sessions are entirely symmetric: neither side is defined as the "client" nor the "server". Each side can optionally expose a "main interface" to the other. In typical scenarios with a logical client and server, the server exposes a main interface but the client does not.
+
+By default, `send()` accepts a string, and `receive()` returns a string, with Cap'n Web handling the encoding all the way to and from strings. However, transports that want more control over the serialization can declare the property `encodingLevel` to control how much encoding Cap'n Web does before passing off the message:
+
+* `"string"` (default): Full JSON round-trip. The transport deals in strings only. Cap'n Web handles all encoding/decoding. This is what HTTP batch and WebSocket transports use.
+* `"jsonCompatible"`: The transport works with JavaScript value trees, but they must be JSON-compatible. Cap'n Web still encodes special types, but skips the final `JSON.stringify`. The transport is responsible for serialization (e.g. to CBOR, MessagePack).
+* `"jsonCompatibleWithBytes"`: Like `"jsonCompatible"` except that byte arrays are left as `Uint8Array` instead of base64-encoded, avoiding the ~33% base64 size overhead and the encode/decode CPU cost. Handy for use with serializations like CBOR or MessagePack that support this efficiently.
+* `"structuredClonable"`: Messages are structured-clonable values. Cap'n Web passes through native structured-clone types where possible, while still handling RPC-specific values such as stubs. This is useful when the transport is a `MessagePort` or similar.

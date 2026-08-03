@@ -1,5 +1,12 @@
 # capnweb
 
+## 0.10.0-hibernation-cbor.0
+
+### CBOR experiment line
+
+- **Merged `0.10.0-hibernation.0`** (upstream capnweb 0.10.0 + the positive-base hibernation fix — see that entry below).
+- **Re-based the codec architecture onto upstream's transport encoding levels.** The codec is now a transport concern, matching upstream's direction: a codec transport wrapper implements `RpcTransportWithCustomEncoding` at `jsonCompatibleWithBytes` level (or `structuredClonable` for a codec that opts in), replacing the session-owned codec plumbing. `RpcSessionOptions.codec` is retained as sugar — the session wraps its transport in the codec transport automatically — so existing callers are unchanged. The fork's `wantsBinaryBytes` mechanism is deleted: upstream's `jsonCompatibleWithBytes` level produces the identical raw `["bytes", Uint8Array]` token natively. `RpcTransport` reverts to upstream's string-only shape; binary rides the custom-encoding interface. MessagePort sessions no longer take a codec (upstream posts structured-clonable objects directly — strictly better than encoding to bytes over a port). Stateful codec snapshot state now rides via optional `snapshotState()`/`restoreState()` hooks on the custom-encoding transport; the snapshot's v3 `codec: {id, state}` shape and id-mismatch guard are unchanged. Incoming binary frames are size-capped by the wrapper before decode (default `DEFAULT_LIMITS.maxMessageSize`), restoring the resource-exhaustion protection upstream only applies at "string" level.
+
 ## 0.8.0-hibernation-cbor.7
 
 Merges `0.8.0-hibernation.3` into the CBOR experiment line: adds the built-in WebCrypto snapshot security helper (`__experimental_newWebCryptoSnapshotSecurity`) and the adversarial security test suite — see the `0.8.0-hibernation.3` entry below for full details. No CBOR-codec changes.
@@ -54,6 +61,14 @@ Experimental prerelease published under the npm `experimental` dist-tag (not `la
 
 - The built-in transports (WebSocket, hibernatable WebSocket, MessagePort, Bun, HTTP batch) now carry `string | Uint8Array`; the JSON path is unchanged.
 - This build is unit/integration-tested but not yet exercised in a live runtime (real WebSocket / Durable Object hibernate-wake cycle). Treat as experimental.
+
+## 0.10.0-hibernation.0
+
+### Hibernation fork
+
+- **Merged upstream capnweb 0.10.0** (from 0.8.x base). Notable upstream additions now in the fork: transport encoding levels (`EncodingLevel`, generic `WebSocketTransport<T>`), configurable receiver-side resource limits (`RpcSessionOptions.limits`), error-deserialization hardening, and WebSocket close-reason truncation. All hibernation functionality is preserved on top; see the upstream 0.9.0–0.10.0 entries below for details.
+
+- **Fixed: capturing calls pipelined off a call result now survive a hibernation wake.** Previously, a replay-recorded call whose base was a *positive* (transient call-result) export — e.g. `cap.persona().avatar(writer)` without awaiting `persona()` — failed on restore with `no such entry on exports table`, closing the socket `1011 "stale session"`, because positive exports are (correctly) dropped from snapshots while the replay expression still referenced one. Snapshots now carry `positiveBases`: for each positive pipeline base a replay references (transitively, deduplicated — recorded only for capturing calls, so there is no broad capture of positive exports), the base's own originating push expression. Restore re-evaluates these in ascending id order before replays run; peer-released bases are re-created only for the duration of replay evaluation and disposed after, and bases with an in-flight pull have the pull re-triggered. The previously-red REPRO stress test in `__tests__/hibernation-persistence.test.ts` is green (and its timing-sensitive control B can no longer fail from this cause).
 
 ## 0.8.0-hibernation.3
 
@@ -111,6 +126,36 @@ Rebased the `capnweb-experimental-hibernation` fork onto upstream `capnweb` 0.8.
 - `HibernatableWebSocketSession<T>` is now generic and `getRemoteMain()` returns `RpcStub<T>`. Both `__experimental_newHibernatableWebSocketRpcSession<T>` and `__experimental_resumeHibernatableWebSocketRpcSession<T>` now thread `T` through to the returned session, eliminating the need for `as unknown as RpcStub<T>` at every call site that needs the worker-side capability.
 - Fixed an import-table leak in `sendCall`, `sendStream`, and `sendMap` when the args payload fails to serialize (e.g. non-serializable argument). The import-table entry is now allocated *after* `Devaluator.devaluate` succeeds, mirroring the upstream first-party shape and avoiding the orphan slot left behind on throw.
 - Fixed an export leak / spurious `toJSON` RPC call triggered by snapshot capture in the `push` and `stream` receive handlers. `cloneRpcExpr(msg[2])` is now called once *before* `evaluateWithCurrentProvenance` mutates the expression in place; reusing the pre-mutation clone for both `importReplays` and `sourceExpr` prevents `JSON.stringify` from probing live `RpcStub` proxies created during evaluation.
+## 0.10.0
+
+### Minor Changes
+
+- [#185](https://github.com/cloudflare/capnweb/pull/185) [`0b20ec6`](https://github.com/cloudflare/capnweb/commit/0b20ec655bc244072f78382b22ef295228b1d259) Thanks [@ndisidore](https://github.com/ndisidore)! - Add configurable receiver-side resource limits (`RpcSessionOptions.limits`) that cap bigint length, message nesting depth, and incoming message size to guard against untrusted-peer resource exhaustion (#184).
+
+### Patch Changes
+
+- [#190](https://github.com/cloudflare/capnweb/pull/190) [`6e5c562`](https://github.com/cloudflare/capnweb/commit/6e5c5622a326540e14602304da84fccf00b2d62d) Thanks [@taylorodell](https://github.com/taylorodell)! - Several correctness and robustness fixes:
+
+  - Error deserialization no longer resolves an attacker-supplied error type name to an inherited `Object.prototype` member. `ERROR_TYPES` now has a null prototype, so a wire value such as `["error","constructor",...]` no longer resolves to `Object` (which produced a `String` wrapper instead of an `Error`, bypassing `instanceof Error` checks), and a name like `"toString"` no longer resolves to a non-constructor and throws. Unknown names correctly fall back to `Error`.
+  - Error deserialization now filters inherited `Object.prototype` keys (and `toJSON`) out of an error's own-property bag, matching the behavior already applied when deserializing plain objects. Keys such as `__proto__`, `toString`, and `valueOf` are no longer copied onto deserialized errors.
+  - Resolving an import that has already been resolved now disposes the redundant resolution instead of overwriting (and leaking) the previous one.
+  - The `abort` message handler now hands error handlers the unwrapped abort reason rather than the internal payload wrapper, matching the `reject` handler.
+  - WebSocket close reasons longer than the 123-byte limit are now truncated on a UTF-8 character boundary, so aborting a session with a long reason no longer throws from `WebSocket.close()`.
+
+## 0.9.1
+
+### Patch Changes
+
+- [#195](https://github.com/cloudflare/capnweb/pull/195) [`78744ca`](https://github.com/cloudflare/capnweb/commit/78744ca99df8c93443556351b5849329765a930c) Thanks [@aleister1102](https://github.com/aleister1102)! - Fix nodeHttpBatchRpcResponse leaving the connection open and crashing with
+  ERR_HTTP_HEADERS_SENT on non-POST requests. It now returns 405 immediately.
+
+## 0.9.0
+
+### Minor Changes
+
+- [#186](https://github.com/cloudflare/capnweb/pull/186) [`c70bbb7`](https://github.com/cloudflare/capnweb/commit/c70bbb77ee5b25672f77d7befef7e711f4a98836) Thanks [@ashkalor](https://github.com/ashkalor)! - Add transport encoding levels so custom RPC transports can work with `jsonCompatible` values, `jsonCompatibleWithBytes` values, or `structuredClonable` messages instead of always receiving JSON strings.
+
+  Note: `MessagePort` sessions now post structured-clonable objects over the port instead of JSON strings. This changes the wire format between the two ends of the port, so both ends of a `MessagePort` session must upgrade to this version together.
 
 ## 0.8.0
 

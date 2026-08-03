@@ -17,14 +17,34 @@ import type {
   RpcSessionSnapshot,
 } from "./hibernation.js";
 import type { RpcSessionDebugState } from "./rpc.js";
+import type { Codec } from "./codec/index.js";
+import { CodecTransport } from "./codec/transport.js";
+
+/** Close-frame reason max UTF-8 bytes: 125 payload − 2-byte status (RFC 6455 §5.5). */
+export const MAX_CLOSE_REASON_BYTES = 125 - 2;
 
 export function newWebSocketRpcSession(
-    webSocket: WebSocket | string, localMain?: any, options?: RpcSessionOptions): RpcStub {
+    webSocket: WebSocket | string, localMain?: any,
+    options?: RpcSessionOptions & {
+      /**
+       * Optional wire codec (e.g. CBOR via `capnweb/codec/cbor`). When set, the layering is
+       * `session → CodecTransport (codec encodes/decodes) → WebSocketTransport (raw frames)`.
+       * There is no codec negotiation in the protocol, so both ends of the session must be
+       * configured with the same codec and codec options. Omitted → standard JSON text.
+       */
+      codec?: Codec;
+    }): RpcStub {
   if (typeof webSocket === "string") {
     webSocket = new WebSocket(webSocket);
   }
 
-  let transport = new WebSocketTransport(webSocket);
+  // `WebSocketTransport`'s runtime accepts both text and binary frames regardless of its
+  // compile-time generic, so it serves directly as the raw pipe under a binary codec.
+  let inner = new WebSocketTransport(webSocket);
+  let transport = options?.codec
+      ? new CodecTransport(inner, options.codec,
+          { maxMessageSize: options.limits?.maxMessageSize })
+      : inner;
   let rpc = new RpcSession(transport, localMain, options);
   return rpc.getRemoteMain();
 }
@@ -67,6 +87,15 @@ export type HibernatableWebSocketOptions = RpcSessionOptions & {
    * ID or room ID. `sessionId` and storage mode are always included by capnweb.
    */
   snapshotSecurityAssociatedData?: unknown;
+  /**
+   * Optional wire codec (e.g. CBOR via `capnweb/codec/cbor`). When set, the session's transport
+   * stack becomes `session → CodecTransport → hibernatable WebSocket transport`. A stateful
+   * codec's accumulated state rides inside the session snapshot (version 3) and is restored on
+   * wake — configure the SAME codec (and codec options) when resuming, or restore will refuse
+   * with a codec-mismatch error. Both ends of the session must use the same codec; there is no
+   * negotiation in the protocol. Use a fresh codec instance per session.
+   */
+  codec?: Codec;
   __experimental_trace?: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => void;
 };
 
@@ -147,8 +176,19 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     }
   }, trace);
 
+  // With a codec, the session talks to a CodecTransport that encodes/decodes and passes raw
+  // frames through the hibernatable transport underneath. The hibernatable machinery (below)
+  // keeps driving the INNER transport directly (pushIncoming / notifyClosed / notifyError).
+  // Without a codec the session speaks JSON text and only string frames ever arrive; the
+  // transport's receive type is wider only because the same class serves binary codec
+  // sessions, so asserting the string-only RpcTransport shape states a runtime fact.
+  const sessionTransport = options.codec
+      ? new CodecTransport(transport, options.codec,
+          { maxMessageSize: options.limits?.maxMessageSize })
+      : transport as RpcTransport;
+
   try {
-    rpc = new RpcSession(transport, localMain, {
+    rpc = new RpcSession(sessionTransport, localMain, {
       ...options,
       __experimental_restoreSnapshot: snapshot,
       __experimental_trace: (event) => trace(event),
@@ -434,14 +474,16 @@ function makeSessionId(): string {
   return `capnweb-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-class WebSocketTransport implements RpcTransport {
+/**
+ * Generic WebSocket transport. Default `T = string` is backward-compatible and satisfies
+ * `RpcTransport`. Use `T = ArrayBuffer` as a building block for binary transports.
+ */
+export class WebSocketTransport<T extends string | ArrayBuffer = string> {
   constructor (webSocket: WebSocket) {
     this.#webSocket = webSocket;
 
-    // Deliver binary frames as ArrayBuffer (not Blob) so a binary codec (e.g.
-    // CBOR) can read them synchronously. Harmless for the default JSON codec,
-    // which uses text frames.
-    try { webSocket.binaryType = "arraybuffer"; } catch (_err) { /* not settable in some envs */ }
+    // Always set binaryType — harmless for string mode, required for ArrayBuffer mode.
+    webSocket.binaryType = "arraybuffer";
 
     if (webSocket.readyState === WebSocket.CONNECTING) {
       this.#sendQueue = [];
@@ -460,22 +502,16 @@ class WebSocketTransport implements RpcTransport {
     webSocket.addEventListener("message", (event: MessageEvent<any>) => {
       if (this.#error) {
         // Ignore further messages.
-      } else if (typeof event.data === "string"
-                 || event.data instanceof Uint8Array
-                 || event.data instanceof ArrayBuffer) {
-        // Strings carry the default JSON codec; binary frames carry a binary
-        // codec (e.g. CBOR). Normalize ArrayBuffer to Uint8Array.
-        let message: string | Uint8Array =
-            event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : event.data;
+      } else if (typeof event.data === "string" || event.data instanceof ArrayBuffer) {
         if (this.#receiveResolver) {
-          this.#receiveResolver(message);
+          this.#receiveResolver(event.data as T);
           this.#receiveResolver = undefined;
           this.#receiveRejecter = undefined;
         } else {
-          this.#receiveQueue.push(message);
+          this.#receiveQueue.push(event.data as T);
         }
       } else {
-        this.#receivedError(new TypeError("Received unsupported message type from WebSocket."));
+        this.#receivedError(new TypeError("Received unexpected message type from WebSocket."));
       }
     });
 
@@ -489,13 +525,13 @@ class WebSocketTransport implements RpcTransport {
   }
 
   #webSocket: WebSocket;
-  #sendQueue?: (string | Uint8Array)[];  // only if not opened yet
-  #receiveResolver?: (message: string | Uint8Array) => void;
+  #sendQueue?: T[];  // only if not opened yet
+  #receiveResolver?: (message: T) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: (string | Uint8Array)[] = [];
+  #receiveQueue: T[] = [];
   #error?: any;
 
-  async send(message: string | Uint8Array): Promise<void> {
+  send(message: T): void {
     if (this.#sendQueue === undefined) {
       this.#webSocket.send(message);
     } else {
@@ -504,25 +540,33 @@ class WebSocketTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string | Uint8Array> {
+  receive(): Promise<T> {
     if (this.#receiveQueue.length > 0) {
-      return this.#receiveQueue.shift()!;
+      return Promise.resolve(this.#receiveQueue.shift()!);
     } else if (this.#error) {
-      throw this.#error;
+      return Promise.reject(this.#error);
     } else {
-      return new Promise<string | Uint8Array>((resolve, reject) => {
+      return new Promise<T>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });
     }
   }
 
-  abort?(reason: any): void {
+  abort(reason: any): void {
     let message: string;
     if (reason instanceof Error) {
       message = reason.message;
+    } else if (typeof reason === "string") {
+      message = reason;
     } else {
-      try { message = JSON.stringify(reason); } catch { message = `${reason}`; }
+      // JSON renders non-string reasons (e.g. objects) more usefully than "[object Object]".
+      try { message = JSON.stringify(reason) ?? `${reason}`; } catch { message = `${reason}`; }
+    }
+    // `stream: true` drops a trailing partial code point rather than emitting a replacement char.
+    let reasonBytes = new TextEncoder().encode(message);
+    if (reasonBytes.length > MAX_CLOSE_REASON_BYTES) {
+      message = new TextDecoder().decode(reasonBytes.subarray(0, MAX_CLOSE_REASON_BYTES), { stream: true });
     }
     this.#webSocket.close(3000, message);
 
@@ -544,7 +588,14 @@ class WebSocketTransport implements RpcTransport {
   }
 }
 
-class HibernatableWebSocketTransport implements RpcTransport {
+// This class is generic, so it can't `implements RpcTransport` (that would require every `T` to
+// conform, but the ArrayBuffer instantiation intentionally doesn't). The default string
+// instantiation's conformance is asserted in __type-tests__/rpc-types.test.ts.
+
+// Carries `string | Uint8Array` frames (binary for codec sessions), so it is intentionally wider
+// than `RpcTransport` and doesn't declare `implements`. Codec-less sessions assert the
+// string-only shape at the single construction site above.
+class HibernatableWebSocketTransport {
   constructor(
       private webSocket: WebSocket,
       private onActivity?: () => void,
@@ -617,8 +668,17 @@ class HibernatableWebSocketTransport implements RpcTransport {
     let message: string;
     if (reason instanceof Error) {
       message = reason.message;
+    } else if (typeof reason === "string") {
+      message = reason;
     } else {
-      try { message = JSON.stringify(reason); } catch { message = `${reason}`; }
+      // JSON renders non-string reasons (e.g. objects) more usefully than "[object Object]".
+      try { message = JSON.stringify(reason) ?? `${reason}`; } catch { message = `${reason}`; }
+    }
+
+    // `stream: true` drops a trailing partial code point rather than emitting a replacement char.
+    let reasonBytes = new TextEncoder().encode(message);
+    if (reasonBytes.length > MAX_CLOSE_REASON_BYTES) {
+      message = new TextDecoder().decode(reasonBytes.subarray(0, MAX_CLOSE_REASON_BYTES), { stream: true });
     }
 
     try {

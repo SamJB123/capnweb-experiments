@@ -16,28 +16,34 @@ import {
   mapImpl,
   __experimental_debugStubHookIdentity,
 } from "./core.js";
-import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize } from "./serialize.js";
+import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize,
+         EncodingLevel, RpcLimits, DEFAULT_LIMITS } from "./serialize.js";
 import { __experimental_recordInputPath } from "./map.js";
 import type {
+  RpcSessionCodecState,
   RpcSessionExportProvenance,
   RpcSessionImportReplay,
   RpcSessionSnapshot,
+  RpcSessionSnapshotPositiveBase,
 } from "./hibernation.js";
-import { type Codec, jsonCodec } from "./codec/index.js";
 
 /**
- * Interface for an RPC transport, which is a simple bidirectional message stream. Implement this
- * interface if the built-in transports (e.g. for HTTP batch and WebSocket) don't meet your needs.
+ * Interface for a string-based RPC transport. This is the default transport type — no
+ * `encodingLevel` field is needed. Messages are JSON strings. Implement this interface if the
+ * built-in transports (e.g. for HTTP batch and WebSocket) don't meet your needs.
  */
 export interface RpcTransport {
   /**
-   * Sends a message to the other end.
-   *
-   * Messages are `string` for the default JSON codec. A transport may also
-   * receive `Uint8Array` when a binary codec (e.g. CBOR) is in use; transports
-   * that only support text may treat that as unsupported.
+   * The encoding level this transport works with. For this interface it is always "string";
+   * it may be omitted. (See `RpcTransportWithCustomEncoding` for the other levels.)
    */
-  send(message: string | Uint8Array): Promise<void>;
+  readonly encodingLevel?: "string";
+
+  /**
+   * Sends a message to the other end. May optionally return a promise; if the promise rejects,
+   * the session is aborted.
+   */
+  send(message: string): void | Promise<void>;
 
   /**
    * Receives a message sent by the other end.
@@ -47,7 +53,7 @@ export interface RpcTransport {
    * If there are no outstanding calls (and none are made in the future), then the error does not
    * propagate anywhere -- this is considered a "clean" shutdown.
    */
-  receive(): Promise<string | Uint8Array>;
+  receive(): Promise<string>;
 
   /**
    * Indicates that the RPC system has suffered an error that prevents the session from continuing.
@@ -57,6 +63,136 @@ export interface RpcTransport {
    * peer, so if that is dropped, the peer may have less information about what happened.)
    */
   abort?(reason: any): void;
+}
+
+/**
+ * Interface for a transport that receives partially encoded JS values instead of JSON strings.
+ * The selected `encodingLevel` describes what the transport can assume about message values.
+ */
+export interface RpcTransportWithCustomEncoding {
+  /**
+   * The encoding level this transport works with.
+   *
+   * - "jsonCompatible": JSON-compatible JS value tree; transport handles final serialization.
+   * - "jsonCompatibleWithBytes": Like "jsonCompatible" but Uint8Array values are left raw.
+   * - "structuredClonable": Structured-clonable native values pass through where possible.
+   */
+  readonly encodingLevel: "jsonCompatible" | "jsonCompatibleWithBytes" | "structuredClonable";
+
+  /**
+   * Encodes and sends a message to the other end. Returns the encoded byte size if known.
+   * If the size is unavailable, return void; Cap'n Web will estimate stream message sizes for
+   * flow control. Send errors should be propagated via `receive()` rejecting.
+   */
+  send(message: unknown): number | void;
+
+  /**
+   * Receives and decodes a message sent by the other end.
+   *
+   * If and when the transport becomes disconnected, this will reject. The thrown error will be
+   * propagated to all outstanding calls and future calls on any stubs associated with the session.
+   * If there are no outstanding calls (and none are made in the future), then the error does not
+   * propagate anywhere -- this is considered a "clean" shutdown.
+   */
+  receive(): Promise<unknown>;
+
+  /**
+   * Indicates that the RPC system has suffered an error that prevents the session from continuing.
+   * The transport should ideally try to send any queued messages if it can, and then close the
+   * connection. (It's not strictly necessary to deliver queued messages, but the last message sent
+   * before abort() is called is often an "abort" message, which communicates the error to the
+   * peer, so if that is dropped, the peer may have less information about what happened.)
+   */
+  abort?(reason: any): void;
+
+  /**
+   * OPTIONAL (hibernation fork). A transport with per-session accumulated state (e.g. a codec
+   * transport wrapping a stateful CBOR codec) implements these so its state rides inside the
+   * session's hibernation snapshot and survives a wake in sync with the peer. `snapshotState`
+   * returning undefined means "nothing to snapshot" (the snapshot stays at version 2).
+   * `restoreState` must throw if the snapshotted state is not compatible with this transport
+   * (e.g. codec id mismatch).
+   */
+  snapshotState?(): RpcSessionCodecState | undefined;
+  restoreState?(state: RpcSessionCodecState): void;
+}
+
+/** Any supported transport type. */
+export type AnyRpcTransport = RpcTransport | RpcTransportWithCustomEncoding;
+
+const ESTIMATED_OBJECT_OVERHEAD = 16;
+const ESTIMATED_ENTRY_OVERHEAD = 8;
+const ESTIMATED_BINARY_OVERHEAD = 16;
+const MAX_ESTIMATE_DEPTH = 64;
+
+function estimateStringSize(value: string): number {
+  // Bias high. UTF-8 uses up to 3 bytes for BMP code points, and surrogate pairs are 4 bytes for
+  // 2 UTF-16 code units.
+  return 2 + value.length * 3;
+}
+
+function estimateEncodedSize(value: unknown, seen?: WeakSet<object>, depth: number = 0): number {
+  if (depth >= MAX_ESTIMATE_DEPTH) return ESTIMATED_ENTRY_OVERHEAD;
+
+  switch (typeof value) {
+    case "string":
+      return estimateStringSize(value);
+    case "number":
+      return 16;
+    case "bigint":
+      return 16;
+    case "boolean":
+      return 8;
+    case "undefined":
+      return 16;
+    case "object": {
+      if (value === null) return 8;
+      if (ArrayBuffer.isView(value)) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
+      if (value instanceof ArrayBuffer) return ESTIMATED_BINARY_OVERHEAD + value.byteLength;
+      if (typeof Blob !== "undefined" && value instanceof Blob) {
+        return ESTIMATED_BINARY_OVERHEAD + value.size;
+      }
+      if (value instanceof Date) return 16;
+
+      // `seen` is only ever added to, never removed, so it dedupes by object identity across the
+      // entire traversal rather than just along the current path. This is intentional: it keeps the
+      // estimate safe against cyclic graphs (which would otherwise recurse forever). The trade-off
+      // is that a value reachable via two different paths (shared but acyclic) is counted in full
+      // the first time and only as ESTIMATED_ENTRY_OVERHEAD afterward, so shared substructure
+      // under-counts slightly. That's acceptable here — this is a flow-control estimate, not an
+      // exact serialized size, and it otherwise biases high.
+      seen ??= new WeakSet();
+      if (seen.has(value)) return ESTIMATED_ENTRY_OVERHEAD;
+      seen.add(value);
+
+      if (value instanceof Array) {
+        let size = ESTIMATED_OBJECT_OVERHEAD;
+        for (let item of value) {
+          size += ESTIMATED_ENTRY_OVERHEAD + estimateEncodedSize(item, seen, depth + 1);
+        }
+        return size;
+      }
+
+      if (value instanceof Error) {
+        let size = ESTIMATED_OBJECT_OVERHEAD + estimateStringSize(value.name) +
+            estimateStringSize(value.message) + estimateStringSize(value.stack ?? "");
+        for (let key of Object.keys(value)) {
+          size += ESTIMATED_ENTRY_OVERHEAD + estimateStringSize(key) +
+              estimateEncodedSize((value as any)[key], seen, depth + 1);
+        }
+        return size;
+      }
+
+      let size = ESTIMATED_OBJECT_OVERHEAD;
+      for (let key of Object.keys(value)) {
+        size += ESTIMATED_ENTRY_OVERHEAD + estimateStringSize(key) +
+            estimateEncodedSize((value as Record<string, unknown>)[key], seen, depth + 1);
+      }
+      return size;
+    }
+    default:
+      return 16;
+  }
 }
 
 // Entry on the exports table.
@@ -392,13 +528,6 @@ export type RpcSessionOptions = {
   onSendError?: (error: Error) => Error | void;
 
   /**
-   * Optional wire codec. Defaults to the standard JSON codec when omitted, so
-   * the wire format is unchanged. Provide an alternative codec (e.g. CBOR) to
-   * encode messages differently. Both ends of a session must use the same codec.
-   */
-  codec?: Codec;
-
-  /**
    * EXPERIMENTAL: Restore a session from a previously-captured snapshot.
    */
   __experimental_restoreSnapshot?: RpcSessionSnapshot;
@@ -407,6 +536,17 @@ export type RpcSessionOptions = {
    * EXPERIMENTAL: Low-level trace hook for observing session message flow.
    */
   __experimental_trace?: (event: RpcTraceEvent) => void;
+
+  /**
+   * Overrides for the resource limits enforced while deserializing messages from the peer. Any
+   * field left unset falls back to `DEFAULT_LIMITS`. These guard against resource-exhaustion
+   * attacks from untrusted peers; see `RpcLimits` for the meaning and defaults of each field.
+   *
+   * Limits are a purely local, receiver-side decision -- the protocol has no negotiation step, so
+   * the peer never learns these values. A message that exceeds a limit is rejected, aborting the
+   * session.
+   */
+  limits?: Partial<RpcLimits>;
 };
 
 export type RpcTraceEvent = {
@@ -441,6 +581,11 @@ export type RpcSessionDebugState = {
 };
 
 function cloneRpcExpr<T>(value: T): T {
+  // At non-"string" encoding levels the expression may contain native values (BigInt, Date,
+  // ArrayBuffer, ...) that a JSON round-trip cannot represent.
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
   return JSON.parse(JSON.stringify(value));
 }
 
@@ -456,6 +601,11 @@ class RpcSessionImpl implements Importer, Exporter {
   private reverseExports: Map<StubHook, ExportId> = new Map();
   private imports: Array<ImportTableEntry> = [];
   private importReplays: RpcSessionImportReplay[] = [];
+  // For every positive (call-result) export referenced as a pipeline base by a replay
+  // expression: the push expression that created it. Kept in a separate map because the export
+  // table entry may be released (peer got its resolution) long before a snapshot is taken, while
+  // the replay still needs the base re-established on restore.
+  private replayBaseExprs: Map<number, unknown> = new Map();
   private abortReason?: any;
   private cancelReadLoop?: (error: any) => void;
 
@@ -480,12 +630,34 @@ class RpcSessionImpl implements Importer, Exporter {
   // may be deleted from the middle (hence leaving the array sparse).
   onBrokenCallbacks: ((error: any) => void)[] = [];
 
-  // Wire codec. Defaults to JSON, preserving the standard wire format.
-  private codec: Codec;
+  // Encoding level from the transport (defaults to "string")
+  private encodingLevel: EncodingLevel;
 
-  constructor(private transport: RpcTransport, mainHook: StubHook,
+  // Resource limits enforced on incoming messages, resolved once from the defaults plus any
+  // per-session overrides.
+  private limits: RpcLimits;
+
+  constructor(private transport: AnyRpcTransport, mainHook: StubHook,
       private options: RpcSessionOptions) {
-    this.codec = options.codec ?? jsonCodec;
+    // `RpcTransport` has no `encodingLevel` field, so its presence is what marks a custom-encoding
+    // transport. Read it defensively: treat a present-but-`undefined` value (e.g. an uninitialized
+    // class field) as the default string level rather than mis-routing it down the custom-encoding
+    // path, and reject any other unrecognized value (e.g. a stale pre-rename level name) loudly
+    // instead of silently corrupting the wire.
+    let level: EncodingLevel = "string";
+    if ('encodingLevel' in transport) {
+      let raw = transport.encodingLevel as unknown;
+      if (raw !== undefined) {
+        if (raw !== "string" && raw !== "jsonCompatible" &&
+            raw !== "jsonCompatibleWithBytes" && raw !== "structuredClonable") {
+          throw new TypeError(`Unknown transport encodingLevel: ${String(raw)}`);
+        }
+        level = raw;
+      }
+    }
+    this.encodingLevel = level;
+
+    this.limits = { ...DEFAULT_LIMITS, ...options.limits };
 
     // Export zero is automatically the bootstrap object.
     this.exports.push({hook: mainHook, refcount: 1});
@@ -501,13 +673,6 @@ class RpcSessionImpl implements Importer, Exporter {
     this.readLoop().catch(err => this.abort(err));
   }
 
-  // Exporter capability: defer to the wire codec. Only a codec that declares
-  // `binary` (the CBOR codec) opts into raw-byte devaluation; the default JSON
-  // codec leaves it falsy, so the text path is never taken accidentally.
-  wantsBinaryBytes(): boolean {
-    return !!this.codec.binary;
-  }
-
   private trace(phase: string, detail?: Record<string, unknown>) {
     try {
       this.options.__experimental_trace?.({
@@ -520,11 +685,34 @@ class RpcSessionImpl implements Importer, Exporter {
     }
   }
 
+  // For a newly-recorded replay, remember how to re-create every positive (call-result) export
+  // its expression references — transitively, since a base's own source expression may itself
+  // pipeline off an earlier call result. Positive exports are dropped from snapshots (they're
+  // normally transient), so a replay that pipelines off one needs the base's originating
+  // expression re-evaluated on restore before the replay can run.
+  private recordReplayBaseExprs(expr: unknown) {
+    let ids = new Set<number>();
+    collectPositiveExportBaseIds(expr, ids);
+    for (let id of ids) {
+      if (this.replayBaseExprs.has(id)) continue;
+      let src = this.exports[id]?.sourceExpr;
+      if (src === undefined) {
+        // No originating expression (e.g. a pipe export) — the base can't be re-established on
+        // restore. Leave a trace; the replay will fail on wake exactly as it did before this
+        // mechanism existed.
+        this.trace("recordReplayBaseExprs.unrestorable", { exportId: id });
+        continue;
+      }
+      this.replayBaseExprs.set(id, src);
+      this.recordReplayBaseExprs(src);
+    }
+  }
+
   private evaluateWithCurrentProvenance(expr: unknown): RpcPayload {
     const previousExpr = this.currentNegativeExportProvenanceExpr;
     this.currentNegativeExportProvenanceExpr = expr;
     try {
-      return new Evaluator(this).evaluate(expr);
+      return new Evaluator(this, this.encodingLevel).evaluate(expr);
     } finally {
       this.currentNegativeExportProvenanceExpr = previousExpr;
     }
@@ -710,7 +898,7 @@ class RpcSessionImpl implements Importer, Exporter {
           // belongs to the hook which sticks around to handle pipelined requests.
           let value: unknown;
           try {
-            value = Devaluator.devaluate(payload.value, undefined, this, payload);
+            value = Devaluator.devaluate(payload.value, undefined, this, payload, this.encodingLevel);
           } finally {
             this.currentNegativeExportProvenanceExpr = previousExpr;
             this.currentResolveReplay = previousReplay;
@@ -724,7 +912,7 @@ class RpcSessionImpl implements Importer, Exporter {
             exportId,
             error: error instanceof Error ? error.message : String(error),
           });
-          this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this)]);
+          this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this, undefined, this.encodingLevel)]);
           if (autoRelease) this.releaseExport(exportId, 1);
         }
       ).catch(
@@ -736,7 +924,7 @@ class RpcSessionImpl implements Importer, Exporter {
               exportId,
               error: error instanceof Error ? error.message : String(error),
             });
-            this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this)]);
+            this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this, undefined, this.encodingLevel)]);
             if (autoRelease) this.releaseExport(exportId, 1);
           } catch (error2) {
             // TODO: Shouldn't happen, now what?
@@ -833,12 +1021,24 @@ class RpcSessionImpl implements Importer, Exporter {
       });
     }
 
-    // Capture stateful wire-codec state (e.g. CBOR structure tables) so it
-    // survives hibernation in sync with the peer. Stateless codecs (the JSON
-    // default) omit `snapshotState`, leaving the snapshot at version 2.
-    const codec = this.codec.snapshotState
-      ? { id: this.codec.id, state: this.codec.snapshotState() }
-      : undefined;
+    // Positive call-result exports that replay expressions pipeline off. Serialized in ascending
+    // id order (= original creation order), so a chained base can reference an earlier one.
+    const positiveBases = [...this.replayBaseExprs.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([id, expr]): RpcSessionSnapshotPositiveBase => {
+          let entry = this.exports[id];
+          return {
+            id,
+            refcount: entry?.refcount ?? 0,
+            expr,
+            ...(entry?.pull ? { pulling: true } : {}),
+          };
+        });
+
+    // Capture stateful transport/codec state (e.g. CBOR structure tables) so it survives
+    // hibernation in sync with the peer. Stateless setups (the JSON default, stateless CBOR)
+    // return undefined here, leaving the snapshot at version 2.
+    const codec = (this.transport as RpcTransportWithCustomEncoding).snapshotState?.();
 
     return {
       version: codec ? 3 : 2,
@@ -846,6 +1046,7 @@ class RpcSessionImpl implements Importer, Exporter {
       exports,
       ...(imports.length > 0 ? {imports} : {}),
       ...(this.importReplays.length > 0 ? { importReplays: this.importReplays } : {}),
+      ...(positiveBases.length > 0 ? { positiveBases } : {}),
       ...(codec ? { codec } : {}),
     };
   }
@@ -858,6 +1059,10 @@ class RpcSessionImpl implements Importer, Exporter {
     let readable = entry.pipeReadable;
     entry.pipeReadable = undefined;
     return readable;
+  }
+
+  getLimits(): RpcLimits {
+    return this.limits;
   }
 
   createPipe(readable: ReadableStream, readableHook: StubHook): ImportId {
@@ -881,36 +1086,69 @@ class RpcSessionImpl implements Importer, Exporter {
     return importId;
   }
 
-  // Serializes and sends a message. Returns the byte length of the serialized message.
-  private send(msg: any): number {
+  // Serializes and sends a message. Returns the byte length reported by the transport, or
+  // undefined if the transport doesn't report size.
+  private send(msg: any): number | undefined {
     if (this.abortReason !== undefined) {
       // Ignore sends after we've aborted.
       return 0;
     }
 
-    let wire: string | Uint8Array;
-    try {
-      wire = this.codec.encode(msg);
-    } catch (err) {
-      // If encoding failed, there's something wrong with the devaluator, as it should
-      // not allow non-encodable values to be injected in the first place.
-      try { this.abort(err); } catch (err2) {}
-      throw err;
+    if (this.encodingLevel === "string") {
+      let msgText: string;
+      try {
+        msgText = JSON.stringify(msg);
+      } catch (err) {
+        // If JSON stringification failed, there's something wrong with the devaluator, as it
+        // should not allow non-JSONable values to be injected in the first place.
+        try { this.abort(err); } catch (err2) {}
+        throw err;
+      }
+
+      this.trace("send", {
+        kind: msg instanceof Array ? msg[0] : typeof msg,
+        byteLength: msgText.length,
+      });
+
+      try {
+        let sent = (this.transport as RpcTransport).send(msgText) as Promise<void> | undefined;
+        if (sent !== undefined && typeof sent.catch === "function") {
+          // If send fails, abort the connection, but don't try to send an abort message since
+          // that'll probably also fail.
+          sent.catch(err => this.abort(err, false));
+        }
+      } catch (err) {
+        // The transport threw synchronously. Treat it like an async send failure: abort the
+        // session (without trying to send an abort message over the broken transport), but
+        // defer to a microtask so the caller finishes its own bookkeeping first, matching the
+        // timing of a rejected promise from an async transport.
+        queueMicrotask(() => this.abort(err, false));
+      }
+      return msgText.length;
+    } else {
+      // Custom encoding transport encodes and returns the actual encoded size, or void if size
+      // is unavailable (e.g. structured clone).
+      this.trace("send", { kind: msg instanceof Array ? msg[0] : typeof msg });
+      try {
+        let size = (this.transport as RpcTransportWithCustomEncoding).send(msg);
+        if (typeof size === "number") {
+          return size;
+        }
+        // Defend against transports that return something other than a number, e.g. an
+        // accidentally-async `send()` returning a promise: treat the size as unknown, and
+        // observe any returned thenable so a rejection aborts the session rather than going
+        // unhandled. (The documented contract is to report errors via `receive()`.)
+        let thenable = size as unknown;
+        if (thenable && typeof (thenable as PromiseLike<unknown>).then === "function") {
+          Promise.resolve(thenable).catch(err => this.abort(err, false));
+        }
+        return undefined;
+      } catch (err) {
+        // Same as the synchronous failure case above.
+        queueMicrotask(() => this.abort(err, false));
+        return undefined;
+      }
     }
-
-    let byteLength = typeof wire === "string" ? wire.length : wire.byteLength;
-
-    this.trace("send", {
-      kind: msg instanceof Array ? msg[0] : typeof msg,
-      byteLength,
-    });
-
-    this.transport.send(wire)
-        // If send fails, abort the connection, but don't try to send an abort message since
-        // that'll probably also fail.
-        .catch(err => this.abort(err, false));
-
-    return byteLength;
   }
 
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
@@ -918,7 +1156,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     let value: Array<any> = ["pipeline", id, path];
     if (args) {
-      let devalue = Devaluator.devaluate(args.value, undefined, this, args);
+      let devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);
 
       // HACK: Since the args is an array, devaluator will wrap in a second array. Need to unwrap.
       // TODO: Clean this up somehow.
@@ -945,7 +1183,7 @@ class RpcSessionImpl implements Importer, Exporter {
     if (this.abortReason) throw this.abortReason;
 
     let value: Array<any> = ["pipeline", id, path];
-    let devalue = Devaluator.devaluate(args.value, undefined, this, args);
+    let devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);
 
     // HACK: Since the args is an array, devaluator will wrap in a second array. Need to unwrap.
     // TODO: Clean this up somehow.
@@ -953,7 +1191,11 @@ class RpcSessionImpl implements Importer, Exporter {
 
     // Allocate the import entry AFTER devaluate succeeds. See sendCall for rationale.
     const importId = this.imports.length;
-    let size = this.send(["stream", importId, value]);
+    let msg = ["stream", importId, value];
+    let size = this.send(msg);
+    if (size === undefined) {
+      size = estimateEncodedSize(msg);
+    }
 
     // Create the import entry in "already pulling" state (pulling=true), since stream messages
     // are automatically pulled. Set remoteRefcount to 0 so that resolve() won't send a release
@@ -1028,9 +1270,19 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (trySendAbortMessage) {
       try {
-        this.transport.send(this.codec.encode(["abort", Devaluator
-            .devaluate(error, undefined, this)]))
-            .catch(err => {});
+        let abortMsg = ["abort", Devaluator.devaluate(error, undefined, this, undefined, this.encodingLevel)];
+        if (this.encodingLevel === "string") {
+          let sent = (this.transport as RpcTransport)
+              .send(JSON.stringify(abortMsg)) as Promise<void> | undefined;
+          if (sent !== undefined && typeof sent.catch === "function") {
+            sent.catch(err => {});
+          }
+        } else {
+          let result = (this.transport as RpcTransportWithCustomEncoding).send(abortMsg) as unknown;
+          if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+            Promise.resolve(result).catch(err => {});
+          }
+        }
       } catch (err) {
         // ignore, probably the whole reason we're aborting is because the transport is broken
       }
@@ -1084,17 +1336,33 @@ class RpcSessionImpl implements Importer, Exporter {
       let readCanceled = Promise.withResolvers<never>();
       this.cancelReadLoop = readCanceled.reject;
 
-      let wire: string | Uint8Array;
+      let raw: unknown;
+
       try {
-        wire = await Promise.race([this.transport.receive(), readCanceled.promise]);
+        raw = await Promise.race([this.transport.receive(), readCanceled.promise]);
       } finally {
         if (this.cancelReadLoop === readCanceled.reject) {
           this.cancelReadLoop = undefined;
         }
       }
 
-      let msg = this.codec.decode(wire);
+      // Bound a single string message before parsing it. At this point the transport has already
+      // buffered the complete message; true byte-level / pre-read enforcement belongs in the
+      // transport/socket. This backstop still prevents oversized messages from reaching JSON.parse
+      // and downstream deserialization work, and a throw here propagates out of readLoop and aborts
+      // the session. Only "string"-level transports hand us a measurable wire string; richer
+      // encoding levels deliver an already-decoded value, so the size cap does not apply.
+      if (this.encodingLevel === "string" &&
+          (raw as string).length > this.limits.maxMessageSize) {
+        throw new TypeError(
+            `Incoming message exceeds maximum size of ${this.limits.maxMessageSize} UTF-16 code ` +
+            `units.`);
+      }
+
       if (this.abortReason) break;  // check again before processing
+      // Only parse JSON at "string" level; otherwise message is already an object
+      let msg = this.encodingLevel === "string" ? JSON.parse(raw as string) : raw;
+
       this.trace("receive", {
         kind: msg instanceof Array ? msg[0] : typeof msg,
         length: msg instanceof Array ? msg.length : null,
@@ -1114,6 +1382,9 @@ class RpcSessionImpl implements Importer, Exporter {
               if (containsImportedCapabilityReference(msg[2])) {
                 replayRecord = { expr: sourceExpr };
                 this.importReplays.push(replayRecord);
+                // If this capturing call pipelines off transient call results, remember how to
+                // re-create those bases on restore.
+                this.recordReplayBaseExprs(sourceExpr);
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
                   replayCount: this.importReplays.length,
@@ -1202,11 +1473,11 @@ class RpcSessionImpl implements Importer, Exporter {
               let imp = this.imports[importId];
               if (imp) {
                 if (msg[0] == "resolve") {
-                  imp.resolve(new PayloadStubHook(new Evaluator(this).evaluate(msg[2])));
+                  imp.resolve(new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(msg[2])));
                 } else {
                   // HACK: We expect errors are always simple values (no stubs) so we can just
                   //   pull the value out of the payload.
-                  let payload = new Evaluator(this).evaluate(msg[2]);
+                  let payload = new Evaluator(this, this.encodingLevel).evaluate(msg[2]);
                   payload.dispose();  // just in case -- should be no-op
                   imp.resolve(new ErrorStubHook(payload.value));
                 }
@@ -1217,7 +1488,7 @@ class RpcSessionImpl implements Importer, Exporter {
                 if (msg[0] == "resolve") {
                   // We need to evaluate the resolution and immediately dispose it so that we
                   // release any stubs it contains.
-                  new Evaluator(this).evaluate(msg[2]).dispose();
+                  new Evaluator(this, this.encodingLevel).evaluate(msg[2]).dispose();
                 }
               }
               continue;
@@ -1238,9 +1509,9 @@ class RpcSessionImpl implements Importer, Exporter {
 
           case "abort": {
             this.trace("readLoop.abort");
-            let payload = new Evaluator(this).evaluate(msg[1]);
+            let payload = new Evaluator(this, this.encodingLevel).evaluate(msg[1]);
             payload.dispose();  // just in case -- should be no-op
-            this.abort(payload, false);
+            this.abort(payload.value, false);
             break;
           }
         }
@@ -1355,7 +1626,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (!entry.hook) {
       if (entry.provenance) {
-        const base = new PayloadStubHook(new Evaluator(this).evaluate(cloneRpcExpr(entry.provenance.expr)));
+        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(entry.provenance.expr)));
         try {
           entry.hook = this.deriveExportHookFromBase(entry.provenance, base);
         } finally {
@@ -1381,17 +1652,17 @@ class RpcSessionImpl implements Importer, Exporter {
       throw new Error(`Unsupported RPC session snapshot version: ${snapshot.version}`);
     }
 
-    // Restore stateful wire-codec state first, before the read loop decodes any
-    // message. The codec id must match, or the restored state is meaningless.
+    // Restore stateful transport/codec state first, before any message is decoded. The
+    // transport's restoreState() validates compatibility (e.g. codec id mismatch) and throws.
     if (snapshot.codec) {
-      if (snapshot.codec.id !== this.codec.id) {
+      const transport = this.transport as RpcTransportWithCustomEncoding;
+      if (!transport.restoreState) {
         throw new Error(
-          `Snapshot codec mismatch: snapshot was made with codec "${snapshot.codec.id}" ` +
-          `but this session uses codec "${this.codec.id}".`);
+            `Snapshot contains codec state (codec "${snapshot.codec.id}") but this session's ` +
+            `transport does not support restoreState(). Configure the session with the same ` +
+            `codec the snapshot was made with.`);
       }
-      if (this.codec.restoreState) {
-        this.codec.restoreState(snapshot.codec.state);
-      }
+      transport.restoreState(snapshot.codec);
       this.trace("restoreFromSnapshot.codec", { id: snapshot.codec.id });
     }
 
@@ -1431,6 +1702,35 @@ class RpcSessionImpl implements Importer, Exporter {
       }
     }
 
+    // Re-establish positive (call-result) exports that replay expressions pipeline off. These
+    // were transient at snapshot time; re-evaluating their originating push expressions (in
+    // ascending id order, so chained bases resolve) re-creates the entries the replays below
+    // need. Bases the peer had already released (refcount 0) exist only for the replays' sake
+    // and are torn down again once the replays have run.
+    const transientBases: ExportId[] = [];
+    if (snapshot.positiveBases && snapshot.positiveBases.length > 0) {
+      for (let base of [...snapshot.positiveBases].sort((a, b) => a.id - b.id)) {
+        const expr = cloneRpcExpr(base.expr);
+        this.replayBaseExprs.set(base.id, expr);  // keep restorable across the NEXT hibernation
+        if (this.exports[base.id]) continue;
+        this.trace("restoreFromSnapshot.positiveBase", {
+          exportId: base.id,
+          refcount: base.refcount,
+          pulling: !!base.pulling,
+        });
+        const payload = this.evaluateWithCurrentProvenance(cloneRpcExpr(base.expr));
+        const hook = new PayloadStubHook(payload);
+        hook.ignoreUnhandledRejections();
+        this.exports[base.id] = { hook, refcount: base.refcount, sourceExpr: expr };
+        this.reverseExports.set(hook, base.id);
+        if (base.refcount <= 0) {
+          transientBases.push(base.id);
+        } else if (base.pulling) {
+          pendingPulls.push(base.id);
+        }
+      }
+    }
+
     if (snapshot.importReplays && snapshot.importReplays.length > 0) {
       this.importReplays = snapshot.importReplays.map(cloneImportReplay);
       for (let replay of this.importReplays) {
@@ -1445,7 +1745,7 @@ class RpcSessionImpl implements Importer, Exporter {
         // each via its own export provenance — instead of disposing it. Disposing
         // would run the returned capabilities' disposers and undo the very side
         // effect this replay just re-established.
-        const base = new PayloadStubHook(new Evaluator(this).evaluate(cloneRpcExpr(replay.expr)));
+        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(replay.expr)));
         try {
           for (const producesExportId of producesExportIds) {
             const entry = this.exports[producesExportId];
@@ -1467,6 +1767,19 @@ class RpcSessionImpl implements Importer, Exporter {
       }
     }
 
+    // Peer-released bases only existed for the replays above; drop them again. This mirrors the
+    // disposal that happened in the original session when the peer sent its release.
+    for (let id of transientBases) {
+      let entry = this.exports[id];
+      if (!entry) continue;
+      delete this.exports[id];
+      if (entry.hook) {
+        this.reverseExports.delete(entry.hook);
+        entry.hook.dispose();
+      }
+      this.trace("restoreFromSnapshot.positiveBase.release", { exportId: id });
+    }
+
     if (pendingPulls.length > 0) {
       queueMicrotask(() => {
         for (let id of pendingPulls) {
@@ -1482,6 +1795,27 @@ class RpcSessionImpl implements Importer, Exporter {
       throw new Error(`no such import ID: ${importId}`);
     }
     return new RpcStub(new RpcImportHook(false, entry));
+  }
+}
+
+// Collects the ids of positive (call-result) exports that `value` references as pipeline /
+// import / remap bases. Those entries must exist on the exports table for the expression to be
+// re-evaluated on restore. (Negative bases are durable exports, snapshotted with provenance;
+// id 0 is the bootstrap, always present.)
+function collectPositiveExportBaseIds(value: unknown, out: Set<number>): void {
+  if (value instanceof Array) {
+    if (value.length >= 2 &&
+        (value[0] === "pipeline" || value[0] === "import" || value[0] === "remap") &&
+        typeof value[1] === "number" && value[1] > 0) {
+      out.add(value[1]);
+    }
+    for (let nested of value) {
+      collectPositiveExportBaseIds(nested, out);
+    }
+  } else if (value && typeof value === "object") {
+    for (let nested of Object.values(value as Record<string, unknown>)) {
+      collectPositiveExportBaseIds(nested, out);
+    }
   }
 }
 
@@ -1515,7 +1849,7 @@ export class RpcSession {
   #session: RpcSessionImpl;
   #mainStub: RpcStub;
 
-  constructor(transport: RpcTransport, localMain?: any, options: RpcSessionOptions = {}) {
+  constructor(transport: AnyRpcTransport, localMain?: any, options: RpcSessionOptions = {}) {
     let mainHook: StubHook;
     if (localMain) {
       mainHook = new PayloadStubHook(RpcPayload.fromAppReturn(localMain));

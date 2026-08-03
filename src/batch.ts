@@ -5,6 +5,20 @@
 import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeader, OutgoingHttpHeaders } from "node:http";
+import type { Codec } from "./codec/index.js";
+import { CodecTransport } from "./codec/transport.js";
+
+/** Options accepted by the HTTP batch helpers: session options plus an optional wire codec. */
+export type HttpBatchSessionOptions = RpcSessionOptions & {
+  /**
+   * Optional wire codec (e.g. CBOR via `capnweb/codec/cbor`). When set, the layering is
+   * `session → CodecTransport (codec encodes/decodes) → batch transport`, and binary messages
+   * are length-prefix framed in an `application/octet-stream` body (the response mirrors the
+   * request's framing). Both ends must use the same codec and codec options; there is no codec
+   * negotiation in the protocol. Omitted → newline-delimited JSON text, unchanged.
+   */
+  codec?: Codec;
+};
 
 type WireMessage = string | Uint8Array;
 type SendBatchFunc = (batch: WireMessage[]) => Promise<WireMessage[]>;
@@ -64,7 +78,16 @@ function isBinaryContentType(contentType: string | null | undefined): boolean {
   return contentType.includes(BINARY_CONTENT_TYPE) || contentType.includes("cbor");
 }
 
-class BatchClientTransport implements RpcTransport {
+// Yield a full macrotask; prefer setImmediate because Node/Bun clamp setTimeout(0) to 1ms.
+const yieldToMacrotask: () => Promise<void> =
+  typeof setImmediate === "function"
+    ? () => new Promise(resolve => setImmediate(resolve))
+    : () => new Promise(resolve => setTimeout(resolve, 0));
+
+// Carries `string | Uint8Array` messages (binary when a codec transport sits above), so it is
+// intentionally wider than `RpcTransport` and doesn't declare `implements`. Codec-less sessions
+// assert the string-only shape at the construction sites below.
+class BatchClientTransport {
   constructor(sendBatch: SendBatchFunc) {
     this.#promise = this.#scheduleBatch(sendBatch);
   }
@@ -75,7 +98,7 @@ class BatchClientTransport implements RpcTransport {
   #batchToSend: WireMessage[] | null = [];
   #batchToReceive: WireMessage[] | null = null;
 
-  async send(message: WireMessage): Promise<void> {
+  send(message: WireMessage): void {
     // If the batch was already sent, we just ignore the message, because throwing may cause the
     // RPC system to abort prematurely. Once the last receive() is done then we'll throw an error
     // that aborts the RPC system at the right time and will propagate to all other requests.
@@ -111,7 +134,7 @@ class BatchClientTransport implements RpcTransport {
     // promise in order to explicitly indicate they want the results. Unfortunately, `await`ing
     // a thenable does not call `.then()` immediately -- for some reason it waits for a turn of
     // the microtask queue first, *then* calls `.then()`.
-    await new Promise(resolve => setTimeout(resolve, 0));
+    await yieldToMacrotask();
 
     if (this.#aborted !== undefined) {
       throw this.#aborted;
@@ -124,7 +147,7 @@ class BatchClientTransport implements RpcTransport {
 }
 
 export function newHttpBatchRpcSession(
-    urlOrRequest: string | Request, options?: RpcSessionOptions): RpcStub {
+    urlOrRequest: string | Request, options?: HttpBatchSessionOptions): RpcStub {
   let sendBatch: SendBatchFunc = async (batch: WireMessage[]) => {
     if (batchIsBinary(batch)) {
       // Binary codec: length-prefixed framing over an octet-stream body. The
@@ -159,12 +182,18 @@ export function newHttpBatchRpcSession(
     return body == "" ? [] : body.split("\n");
   };
 
-  let transport = new BatchClientTransport(sendBatch);
+  // Without a codec, only text messages ever flow; the transport's wider message type exists
+  // for the codec case, so asserting the string-only RpcTransport shape states a runtime fact.
+  let inner = new BatchClientTransport(sendBatch);
+  let transport = options?.codec
+      ? new CodecTransport(inner, options.codec, { maxMessageSize: options.limits?.maxMessageSize })
+      : inner as RpcTransport;
   let rpc = new RpcSession(transport, undefined, options);
   return rpc.getRemoteMain();
 }
 
-class BatchServerTransport implements RpcTransport {
+// See the note on BatchClientTransport for why there is no `implements RpcTransport`.
+class BatchServerTransport {
   constructor(batch: WireMessage[]) {
     this.#batchToReceive = batch;
   }
@@ -173,7 +202,7 @@ class BatchServerTransport implements RpcTransport {
   #batchToReceive: WireMessage[];
   #allReceived: PromiseWithResolvers<void> = Promise.withResolvers<void>();
 
-  async send(message: WireMessage): Promise<void> {
+  send(message: WireMessage): void {
     this.#batchToSend.push(message);
   }
 
@@ -218,7 +247,7 @@ class BatchServerTransport implements RpcTransport {
  *     headers, so you can modify them using e.g. `response.headers.set("Foo", "bar")`.
  */
 export async function newHttpBatchRpcResponse(
-    request: Request, localMain: any, options?: RpcSessionOptions): Promise<Response> {
+    request: Request, localMain: any, options?: HttpBatchSessionOptions): Promise<Response> {
   if (request.method !== "POST") {
     return new Response("This endpoint only accepts POST requests.", { status: 405 });
   }
@@ -235,7 +264,11 @@ export async function newHttpBatchRpcResponse(
   }
 
   let transport = new BatchServerTransport(batch);
-  let rpc = new RpcSession(transport, localMain, options);
+  let sessionTransport = options?.codec
+      ? new CodecTransport(transport, options.codec,
+          { maxMessageSize: options.limits?.maxMessageSize })
+      : transport as RpcTransport;
+  let rpc = new RpcSession(sessionTransport, localMain, options);
 
   // TODO: Arguably we should arrange so any attempts to pull promise resolutions from the client
   //   will reject rather than just hang. But it IS valid to make server->client calls in order to
@@ -269,11 +302,13 @@ export async function newHttpBatchRpcResponse(
 export async function nodeHttpBatchRpcResponse(
     request: IncomingMessage, response: ServerResponse,
     localMain: any,
-    options?: RpcSessionOptions & {
+    options?: HttpBatchSessionOptions & {
       headers?: OutgoingHttpHeaders | OutgoingHttpHeader[],
     }): Promise<void> {
   if (request.method !== "POST") {
-    response.writeHead(405, "This endpoint only accepts POST requests.");
+    response.writeHead(405, "This endpoint only accepts POST requests.", options?.headers);
+    response.end();
+    return;
   }
 
   const binary = isBinaryContentType(request.headers["content-type"]);
@@ -299,7 +334,11 @@ export async function nodeHttpBatchRpcResponse(
   }
 
   let transport = new BatchServerTransport(batch);
-  let rpc = new RpcSession(transport, localMain, options);
+  let sessionTransport = options?.codec
+      ? new CodecTransport(transport, options.codec,
+          { maxMessageSize: options.limits?.maxMessageSize })
+      : transport as RpcTransport;
+  let rpc = new RpcSession(sessionTransport, localMain, options);
 
   await transport.whenAllReceived();
   await rpc.drain();

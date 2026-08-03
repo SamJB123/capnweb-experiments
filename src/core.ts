@@ -204,6 +204,18 @@ export function typeForRpc(value: unknown): TypeForRpc {
 
     case Uint8Array.prototype:
     case BUFFER_PROTOTYPE:
+    case ArrayBuffer.prototype:
+    case DataView.prototype:
+    case Int8Array.prototype:
+    case Uint8ClampedArray.prototype:
+    case Int16Array.prototype:
+    case Uint16Array.prototype:
+    case Int32Array.prototype:
+    case Uint32Array.prototype:
+    case BigInt64Array.prototype:
+    case BigUint64Array.prototype:
+    case Float32Array.prototype:
+    case Float64Array.prototype:
       return "bytes";
 
     case WritableStream.prototype:
@@ -1306,6 +1318,61 @@ export class RpcPayload {
       }
     } finally {
       this.dispose();
+    }
+  }
+
+  // Deliver this payload as the argument list to `WritableStreamDefaultWriter.write(chunk)`.
+  //
+  // Unlike deliverCall(), stream chunks are enqueued and read asynchronously. Disposing the
+  // payload when write() returns would free any stubs nested in the chunk before the reader
+  // dequeues them. A chunk only needs its disposal deferred if it owns capabilities the
+  // reader will use after write() resolves. Pure data (primitives, bytes, Date, plain
+  // objects) carries no capabilities, so dispose it immediately and leave the chunk
+  // untouched. Bare RpcStubs already implement Symbol.dispose, so their own disposer owns
+  // the capability; only attach a payload disposer otherwise.
+  //
+  // Expects `this.value` to be a one-element argument array `[chunk]`. Returns a payload
+  // wrapping the (void) write result.
+  public async deliverStreamWrite(
+      writer: { write(chunk: unknown): Promise<void> }): Promise<RpcPayload> {
+    try {
+      let promises: Promise<void>[] = [];
+      this.deliverTo(this, "value", promises);
+
+      // Same e-order constraint as deliverCall: if there are no nested promises, call write
+      // synchronously so concurrent writes stay ordered.
+      if (promises.length > 0) {
+        await Promise.all(promises);
+      }
+
+      let chunk = (this.value as unknown[])[0];
+
+      // deliverTo → ensureDeepCopied, so hooks/promises are populated.
+      const ownsCapabilities = this.hooks!.length > 0 || this.promises!.length > 0;
+
+      if (ownsCapabilities && chunk instanceof Object) {
+        // Keep the payload alive until the reader disposes the chunk. A bare RpcStub already
+        // implements Symbol.dispose (its own disposer owns the hook); only attach otherwise.
+        if (!(Symbol.dispose in chunk)) {
+          Object.defineProperty(chunk, Symbol.dispose, {
+            value: () => this.dispose(),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+          });
+        }
+        await writer.write(chunk);
+        return RpcPayload.fromAppReturn(undefined);
+      }
+
+      // No capabilities (or non-object chunk): nothing to keep alive beyond the write.
+      await writer.write(chunk);
+      this.dispose();
+      return RpcPayload.fromAppReturn(undefined);
+    } catch (err) {
+      // deliverTo / write failed: free any capabilities we still own.
+      this.dispose();
+      throw err;
     }
   }
 
