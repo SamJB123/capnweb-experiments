@@ -168,50 +168,16 @@ function logSideBySide(
 
 describe("real hibernatable DO with capnweb RPC", () => {
   it("websocket attachment survives hibernation and still contains session state", { timeout: 30_000 }, async () => {
-    console.log("DEBUG: worker addr/port:", worker.address, worker.port);
-    console.log("DEBUG: trying HTTP /instance-id via worker.fetch...");
+    const ws = await connectWebSocket();
     try {
-      const httpResp = await Promise.race([
-        worker.fetch("/instance-id").then(r => r.text()),
-        new Promise<string>((_, rej) => setTimeout(() => rej(new Error("HTTP fetch timed out at 5s")), 5000)),
-      ]);
-      console.log("DEBUG: HTTP /instance-id response:", httpResp.slice(0, 200));
-    } catch (e) {
-      console.log("DEBUG: HTTP /instance-id failed:", (e as Error).message);
-    }
-    console.log("DEBUG: connecting WS...");
-    const ws = await Promise.race([
-      connectWebSocket(),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("WS connect timed out at 5s")), 5000)),
-    ]);
-    console.log("DEBUG: WS connected, readyState:", ws.readyState);
-    ws.on("close", (c, r) => console.log("DEBUG: WS closed", c, String(r)));
-    ws.on("error", (e) => console.log("DEBUG: WS error event:", e.message));
-    ws.on("message", (m) => console.log("DEBUG: WS msg:", String(m).slice(0, 200)));
-    try {
-      const push = JSON.stringify(["push", 1, ["pipeline", 0, ["echo"], ["hand-crafted"]]]);
-      const pull = JSON.stringify(["pull", 1]);
-      console.log("DEBUG: sending push:", push);
-      ws.send(push);
-      console.log("DEBUG: sending pull:", pull);
-      ws.send(pull);
-      console.log("DEBUG: waiting 3s for any responses...");
-      await new Promise((r) => setTimeout(r, 3000));
-      console.log("DEBUG: WS readyState after 3s:", ws.readyState);
-      return;
       const root = newWebSocketRpcSession<any>(ws as any);
-      console.log("DEBUG: calling echo...");
-      const echoP = root.echo("prime-attachment");
-      const echoed = await Promise.race([
-        echoP,
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("echo timed out at 5s")), 5000)),
-      ]);
-      console.log("DEBUG: echo returned:", echoed);
-      expect(echoed).toBe("prime-attachment");
+      expect(await root.echo("prime-attachment")).toBe("prime-attachment");
 
       const before = await getAttachments();
       expect(before.count).toBeGreaterThan(0);
-      expect(before.attachments[0]?.version).toBe(1);
+      // The library writes attachment version 2 in sessionStore mode (3 when snapshot
+      // security is configured).
+      expect(before.attachments[0]?.version).toBe(2);
       expect(before.attachments[0]?.sessionId).toBeTruthy();
       expect(before.attachments[0]?.hasSnapshot).toBe(true);
       expect(before.attachments[0]?.snapshot).not.toBeNull();
@@ -226,7 +192,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
       expect(after.count).toBeGreaterThan(0);
       expect(after.attachments.some((item) =>
           item.sessionId === beforeSessionId &&
-          item.version === 1 &&
+          item.version === 2 &&
           item.hasSnapshot)).toBe(true);
     } finally {
       ws.close();
@@ -792,7 +758,8 @@ describe("real hibernatable DO with capnweb RPC", () => {
       expect(attachments.count).toBeGreaterThan(0);
       const a = attachments.attachments[0]!;
       expect(a.sessionId).toBeTruthy();
-      expect(a.version).toBe(1);
+      // The library writes attachment version 2 (plaintext) even without a sessionStore.
+      expect(a.version).toBe(2);
       // Without a sessionStore, the snapshot MUST live inline on the attachment.
       expect(a.hasSnapshot).toBe(true);
       expect(a.snapshot).not.toBeNull();
