@@ -353,8 +353,12 @@ class RecordingSink extends RpcTarget {
  *  This mirrors the portal `Subscription`: holding it = subscribed, disposing it
  *  = unsubscribed. It's exactly what importReplay used to wrongly dispose. */
 class Subscription extends RpcTarget {
+  #pings = 0;
   constructor(private readonly unsubscribe: () => void) {
     super();
+  }
+  ping(): number {
+    return ++this.#pings;
   }
   [Symbol.dispose](): void {
     this.unsubscribe();
@@ -507,6 +511,21 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Observe an RPC rejection by awaiting the RpcPromise itself. Do not pass a
+ * callable RpcPromise to `expect(...).rejects.toThrow("message")`: Vitest's
+ * string `toThrow` path can invoke that proxy as a function and manufacture the
+ * very `"'' is not a function"` failure the assertion was meant to observe.
+ */
+async function rpcRejectionMessage(value: PromiseLike<unknown>): Promise<string | undefined> {
+  try {
+    await value;
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
 /** Fresh store-backed (plaintext) Hub session + a connected client. */
 async function connectHub() {
   const store = new CountingSessionStore();
@@ -547,6 +566,36 @@ async function wake(client: FakeWebSocket, session: any, store: CountingSessionS
 }
 
 describe("hibernatable importReplay rebinds returned capabilities", () => {
+  it("compares repeated calls on eager and lazy restored capabilities", async () => {
+    const eagerConnection = await connectHub();
+    const eagerSink = new RecordingSink();
+    const eagerHandle = await eagerConnection.api.subscribe(eagerSink);
+    expect(await eagerHandle.ping()).toBe(1);
+    expect(await eagerHandle.ping()).toBe(2);
+    await wake(
+      eagerConnection.client,
+      eagerConnection.session,
+      eagerConnection.store,
+    );
+
+    expect(await eagerHandle.ping()).toBe(1);
+    expect(await eagerHandle.ping()).toBe(2);
+
+    const lazyConnection = await connectHub();
+    const lazyResult = await lazyConnection.api.claimNested();
+    const lazyHandle = lazyResult.handle;
+    expect(await lazyHandle.bump()).toBe(1);
+    expect(await lazyHandle.bump()).toBe(2);
+    await wake(
+      lazyConnection.client,
+      lazyConnection.session,
+      lazyConnection.store,
+    );
+
+    expect(await lazyHandle.bump()).toBe(1);
+    expect(await lazyHandle.bump()).toBe(2);
+  });
+
   it("a capability-returning subscription keeps pushing after a wake", async () => {
     const { store, client, session, api } = await connectHub();
     const sink = new RecordingSink();
@@ -560,10 +609,11 @@ describe("hibernatable importReplay rebinds returned capabilities", () => {
     await wake(client, session, store);
 
     await api.broadcast("after");
+    await api.broadcast("after-again");
     await flush();
     // Pre-fix this was ["before"]: the importReplay re-established the subscription
     // and then disposed the returned Subscription, tearing it back down.
-    expect(sink.received).toEqual(["before", "after"]);
+    expect(sink.received).toEqual(["before", "after", "after-again"]);
   });
 
   it("a void-returning subscription still survives a wake (regression guard)", async () => {
@@ -578,8 +628,9 @@ describe("hibernatable importReplay rebinds returned capabilities", () => {
     await wake(client, session, store);
 
     await api.broadcast("after");
+    await api.broadcast("after-again");
     await flush();
-    expect(sink.received).toEqual(["before", "after"]);
+    expect(sink.received).toEqual(["before", "after", "after-again"]);
   });
 
   it("the returned handle still unsubscribes after a wake (no double-subscription)", async () => {
@@ -606,6 +657,7 @@ describe("hibernatable importReplay rebinds returned capabilities", () => {
     const result = await api.claimNested(); // not captured → lazy provenance restore
     const handle = result.handle; // a nested cap (provenance records the path to it)
     expect(await handle.bump()).toBe(1);
+    expect(await handle.bump()).toBe(2);
 
     await wake(client, session, store);
 
@@ -630,8 +682,9 @@ describe("hibernatable importReplay: nested / multiple / conditional capability 
     await wake(client, session, store);
 
     await api.broadcast("after");
+    await api.broadcast("after-again");
     await flush();
-    expect(sink.received).toEqual(["before", "after"]);
+    expect(sink.received).toEqual(["before", "after", "after-again"]);
   });
 
   it("multiple capabilities returned from one call all survive a wake", async () => {
@@ -640,6 +693,7 @@ describe("hibernatable importReplay: nested / multiple / conditional capability 
 
     const bundle = await api.issueAll(sink); // { alerts, news, counter } — hold it
     expect(await bundle.counter.bump()).toBe(1);
+    expect(await bundle.counter.bump()).toBe(2);
     await api.broadcastTopic("alerts", "a1");
     await api.broadcastTopic("news", "n1");
     await flush();
@@ -670,10 +724,12 @@ describe("hibernatable importReplay: nested / multiple / conditional capability 
     await wake(client, session, store);
 
     for (const t of ["room-0", "room-1", "audit"]) await api.broadcastTopic(t, "y");
+    for (const t of ["room-0", "room-1", "audit"]) await api.broadcastTopic(t, "y2");
     await flush();
     expect(sink.received).toEqual([
       "room-0:x", "room-1:x", "audit:x",
       "room-0:y", "room-1:y", "audit:y",
+      "room-0:y2", "room-1:y2", "audit:y2",
     ]);
   });
 
@@ -690,8 +746,11 @@ describe("hibernatable importReplay: nested / multiple / conditional capability 
     await flush();
 
     for (const t of ["room-0", "room-1", "audit"]) await api.broadcastTopic(t, "z");
+    for (const t of ["room-0", "room-1", "audit"]) await api.broadcastTopic(t, "z2");
     await flush();
-    expect(sink.received).toEqual(["room-1:z", "audit:z"]); // room-0 silent
+    expect(sink.received).toEqual([
+      "room-1:z", "audit:z", "room-1:z2", "audit:z2",
+    ]); // room-0 silent on both uses
   });
 });
 
@@ -709,24 +768,30 @@ describe("hibernatable importReplay: conditional / role-based capability issuanc
     await wake(client, session, store);
 
     for (const t of ALL_TOPICS) await api.broadcastTopic(t, "ping");
+    for (const t of ALL_TOPICS) await api.broadcastTopic(t, "ping-again");
     await flush();
     const granted = ALL_TOPICS.filter((t) => sink.received.includes(`${t}:ping`));
-    return { granted, caps, store, client, session, api, sink };
+    const grantedAgain = ALL_TOPICS.filter((t) =>
+      sink.received.includes(`${t}:ping-again`));
+    return { granted, grantedAgain, caps, store, client, session, api, sink };
   }
 
   it("a guest keeps ONLY its read capability after a wake (no privilege escalation)", async () => {
-    const { granted } = await grantedAfterWake("guest");
+    const { granted, grantedAgain } = await grantedAfterWake("guest");
     expect(granted).toEqual(["read"]);
+    expect(grantedAgain).toEqual(["read"]);
   });
 
   it("a moderator keeps read + kick after a wake", async () => {
-    const { granted } = await grantedAfterWake("moderator");
+    const { granted, grantedAgain } = await grantedAfterWake("moderator");
     expect(granted).toEqual(["read", "kick"]);
+    expect(grantedAgain).toEqual(["read", "kick"]);
   });
 
   it("an admin keeps read + kick + shutdown after a wake", async () => {
-    const { granted } = await grantedAfterWake("admin");
+    const { granted, grantedAgain } = await grantedAfterWake("admin");
     expect(granted).toEqual(["read", "kick", "shutdown"]);
+    expect(grantedAgain).toEqual(["read", "kick", "shutdown"]);
   });
 
   it("revoking one role capability after a wake leaves the others intact", async () => {
@@ -740,9 +805,13 @@ describe("hibernatable importReplay: conditional / role-based capability issuanc
     await flush();
 
     for (const t of ALL_TOPICS) await api.broadcastTopic(t, "ping");
+    for (const t of ALL_TOPICS) await api.broadcastTopic(t, "ping-again");
     await flush();
     const granted = ALL_TOPICS.filter((t) => sink.received.includes(`${t}:ping`));
+    const grantedAgain = ALL_TOPICS.filter((t) =>
+      sink.received.includes(`${t}:ping-again`));
     expect(granted).toEqual(["read", "shutdown"]); // kick gone, others intact
+    expect(grantedAgain).toEqual(["read", "shutdown"]);
   });
 });
 
@@ -827,12 +896,32 @@ class LayeredParticipant extends RpcTarget {
 
 class LayeredMetrics {
   trackedBundleCalls = 0;
+  disposedGrandchildren: string[] = [];
 }
+
+type ObservedTraceEvent = {
+  source: string;
+  phase: string;
+  detail?: Record<string, unknown>;
+};
+
+type LayeredCodecOptions = {
+  stateful: boolean;
+  optimizeEnvelope?: boolean;
+  structuredClone?: boolean;
+};
+
+const DEFAULT_LAYERED_CODEC: LayeredCodecOptions = {
+  stateful: true,
+  optimizeEnvelope: true,
+  structuredClone: true,
+};
 
 class LayeredGrandchild extends RpcTarget {
   constructor(
       private readonly name: string,
-      private readonly participant?: any) {
+      private readonly participant?: any,
+      private readonly onDispose?: (name: string) => void) {
     super();
   }
 
@@ -842,6 +931,10 @@ class LayeredGrandchild extends RpcTarget {
 
   async notify(message: string): Promise<void> {
     await this.participant?.onMessage(message);
+  }
+
+  [Symbol.dispose](): void {
+    this.onDispose?.(this.name);
   }
 }
 
@@ -884,9 +977,14 @@ class LayeredChild extends RpcTarget {
     second: LayeredGrandchild;
   } {
     const occurrence = ++this.metrics.trackedBundleCalls;
+    const trackDisposal = (disposedName: string) => {
+      this.metrics.disposedGrandchildren.push(disposedName);
+    };
     return {
-      first: new LayeredGrandchild(`${name}#${occurrence}:first`),
-      second: new LayeredGrandchild(`${name}#${occurrence}:second`),
+      first: new LayeredGrandchild(
+        `${name}#${occurrence}:first`, undefined, trackDisposal),
+      second: new LayeredGrandchild(
+        `${name}#${occurrence}:second`, undefined, trackDisposal),
     };
   }
 }
@@ -919,7 +1017,9 @@ class LayeredRoot extends LayeredSurface {
   }
 }
 
-async function connectLayered() {
+async function connectLayered(
+    traceEvents?: ObservedTraceEvent[],
+    codecOptions: LayeredCodecOptions | false = DEFAULT_LAYERED_CODEC) {
   const store = new CountingSessionStore();
   const metrics = new LayeredMetrics();
   const { client, server } = createFakeWebSocketPair();
@@ -928,11 +1028,8 @@ async function connectLayered() {
     new LayeredRoot(metrics),
     {
       sessionStore: store,
-      codec: createCborCodec({
-        stateful: true,
-        optimizeEnvelope: true,
-        structuredClone: true,
-      }),
+      ...(codecOptions ? { codec: createCborCodec(codecOptions) } : {}),
+      __experimental_trace: (event) => traceEvents?.push(event),
     },
   );
   if (!session) throw new Error("failed to create layered session");
@@ -941,11 +1038,7 @@ async function connectLayered() {
     client as unknown as WebSocket,
     undefined,
     {
-      codec: createCborCodec({
-        stateful: true,
-        optimizeEnvelope: true,
-        structuredClone: true,
-      }),
+      ...(codecOptions ? { codec: createCborCodec(codecOptions) } : {}),
     },
   );
   return { api, client, metrics, session, store };
@@ -955,7 +1048,9 @@ async function wakeLayered(
     client: FakeWebSocket,
     session: any,
     store: CountingSessionStore,
-    metrics = new LayeredMetrics()) {
+    metrics = new LayeredMetrics(),
+    traceEvents?: ObservedTraceEvent[],
+    codecOptions: LayeredCodecOptions | false = DEFAULT_LAYERED_CODEC) {
   const sessionId: string = session.sessionId;
   store.snapshots.set(sessionId, structuredClone(session.__experimental_snapshot()));
 
@@ -968,11 +1063,8 @@ async function wakeLayered(
     {
       sessionStore: store,
       sessionId,
-      codec: createCborCodec({
-        stateful: true,
-        optimizeEnvelope: true,
-        structuredClone: true,
-      }),
+      ...(codecOptions ? { codec: createCborCodec(codecOptions) } : {}),
+      __experimental_trace: (event) => traceEvents?.push(event),
     },
   );
   if (!restored) throw new Error("failed to restore layered session");
@@ -980,15 +1072,345 @@ async function wakeLayered(
   return restored;
 }
 
+describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
+  it("keeps lazily restored capabilities reusable across every wire codec", async () => {
+    const configurations: Array<{
+      name: string;
+      codec: LayeredCodecOptions | false;
+    }> = [
+      { name: "json", codec: false },
+      { name: "stateless-cbor", codec: {
+        stateful: false, optimizeEnvelope: true, structuredClone: true,
+      } },
+      { name: "stateful-no-envelope", codec: {
+        stateful: true, optimizeEnvelope: false, structuredClone: true,
+      } },
+      { name: "stateful-envelope", codec: DEFAULT_LAYERED_CODEC },
+      { name: "stateful-non-structured-clone", codec: {
+        stateful: true, optimizeEnvelope: true, structuredClone: false,
+      } },
+    ];
+
+    for (const configuration of configurations) {
+      const connection = await connectLayered(undefined, configuration.codec);
+      const bundle = await connection.api.bundle(configuration.name);
+      await wakeLayered(
+        connection.client,
+        connection.session,
+        connection.store,
+        connection.metrics,
+        undefined,
+        configuration.codec,
+      );
+      expect(await bundle.first.identify()).toBe(`${configuration.name}:first`);
+      expect(await bundle.first.identify()).toBe(`${configuration.name}:first`);
+    }
+  });
+
+  it("checks whether successive calls reuse the same incoming call-result slot", async () => {
+    const traceEvents: ObservedTraceEvent[] = [];
+    const { api } = await connectLayered(traceEvents);
+    const application = await api.application();
+    const child = await application.child();
+    await child.trackedBundle("slot-a");
+    await child.trackedBundle("slot-b");
+
+    const incomingCallResultIds = traceEvents
+      .filter(event => event.source === "rpc" && event.phase === "readLoop.push")
+      .map(event => event.detail?.exportId)
+      .filter((id): id is number => typeof id === "number");
+
+    // This directly checks the reuse hypothesis. The application(), child(),
+    // and two trackedBundle() calls each receive a distinct incoming slot.
+    expect(incomingCallResultIds).toHaveLength(4);
+    expect(new Set(incomingCallResultIds).size).toBe(4);
+    expect(incomingCallResultIds.slice(-2)).toEqual([3, 4]);
+  });
+
+  it("shows exactly what provenance distinguishes two identical-looking calls", async () => {
+    const { api, session } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    await child.trackedBundle("same-provenance");
+    await child.trackedBundle("same-provenance");
+
+    const trackedExports = session.__experimental_snapshot().exports.filter(
+      (entry: any) => JSON.stringify(entry.provenance?.expr)
+        .includes("same-provenance"));
+    expect(trackedExports).toHaveLength(4);
+
+    // All four retained capabilities have distinct export identities, but the
+    // snapshot stores the same producing expression for both call occurrences.
+    // This test describes the current data; it does not prescribe grouping.
+    expect(new Set(trackedExports.map((entry: any) => entry.id)).size).toBe(4);
+    expect(new Set(trackedExports.map((entry: any) =>
+      JSON.stringify(entry.provenance.expr))).size).toBe(1);
+  });
+
+  it("checks whether sibling exports share or reuse hook objects", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("hook-identity");
+
+    const matching = (state: any) => state.exports.filter((entry: any) =>
+      JSON.stringify(entry.provenance?.expr)?.includes("hook-identity") === true);
+    const beforeWake = matching(session.__experimental_debugState());
+    expect(beforeWake).toHaveLength(2);
+    expect(new Set(beforeWake.map((entry: any) =>
+      entry.hookIdentity?.hookObjectId)).size).toBe(2);
+
+    const restored = await wakeLayered(client, session, store);
+    const immediatelyAfterWake = matching(restored.__experimental_debugState());
+    expect(immediatelyAfterWake.map((entry: any) => entry.hasHook)).toEqual([
+      false,
+      false,
+    ]);
+
+    expect(await bundle.first.identify()).toBe("hook-identity#1:first");
+    expect(await bundle.first.identify()).toBe("hook-identity#1:first");
+    const afterFirstUse = matching(restored.__experimental_debugState());
+    expect(afterFirstUse.map((entry: any) => entry.hasHook)).toEqual([
+      true,
+      false,
+    ]);
+    // Current restoration binds only the requested export. It neither reuses
+    // the original hook nor silently binds the sibling export.
+    expect(afterFirstUse[0].hookIdentity?.hookObjectId).not.toBe(
+      beforeWake[0].hookIdentity?.hookObjectId);
+  });
+
+  it("checks the actual replay order when first then second sibling are used", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("forward-order");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("forward-order#2:first");
+    expect(await bundle.first.identify()).toBe("forward-order#2:first");
+    expect(metrics.trackedBundleCalls).toBe(2);
+    expect(await rpcRejectionMessage(bundle.second.identify())).toBe(
+      "Attempted to use an RPC StubHook after it was disposed.");
+    // The second retained export independently re-runs trackedBundle() before
+    // failing while traversing the already-disposed reconstructed parent.
+    expect(metrics.trackedBundleCalls).toBe(3);
+  });
+
+  it("checks that whichever sibling is used second hits the failure", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("reverse-order");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.second.identify()).toBe("reverse-order#2:second");
+    expect(await bundle.second.identify()).toBe("reverse-order#2:second");
+    expect(await rpcRejectionMessage(bundle.first.identify())).toBe(
+      "Attempted to use an RPC StubHook after it was disposed.");
+    expect(metrics.trackedBundleCalls).toBe(3);
+  });
+
+  it("measures disposal after the successful first replay without changing source", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("baseline-disposal");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("baseline-disposal#2:first");
+    expect(await bundle.first.identify()).toBe("baseline-disposal#2:first");
+    await flush();
+    const replayDisposals = () => metrics.disposedGrandchildren.filter(
+      name => name.startsWith("baseline-disposal#2:"));
+
+    // The replay's unselected second target is released with the temporary
+    // result; the selected first target remains alive behind its export.
+    expect(replayDisposals()).toEqual(["baseline-disposal#2:second"]);
+
+    bundle.first[Symbol.dispose]();
+    await flush();
+    expect(replayDisposals()).toEqual([
+      "baseline-disposal#2:second",
+      "baseline-disposal#2:first",
+    ]);
+  });
+
+  it("measures cleanup of targets created by the failing second replay", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("failed-replay-disposal");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe(
+      "failed-replay-disposal#2:first");
+    expect(await bundle.first.identify()).toBe(
+      "failed-replay-disposal#2:first");
+    expect(await rpcRejectionMessage(bundle.second.identify())).toBe(
+      "Attempted to use an RPC StubHook after it was disposed.");
+    await flush();
+
+    // Even though the second restoration attempt fails, both targets created
+    // by that third trackedBundle() call are released rather than leaked.
+    expect(metrics.disposedGrandchildren.filter(
+      name => name.startsWith("failed-replay-disposal#3:"))).toEqual([
+      "failed-replay-disposal#3:first",
+      "failed-replay-disposal#3:second",
+    ]);
+  });
+
+  it("keeps the reconstructed child reusable after a descendant replay", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("child-reuse-probe");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("child-reuse-probe#2:first");
+    expect(await bundle.first.identify()).toBe("child-reuse-probe#2:first");
+    expect(await (await child.direct("after-descendant")).identify()).toBe(
+      "after-descendant");
+    expect(await (await child.direct("after-descendant-again")).identify()).toBe(
+      "after-descendant-again");
+  });
+
+  it("keeps the reconstructed application reusable", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("application-reuse-probe");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe(
+      "application-reuse-probe#2:first");
+    expect(await bundle.first.identify()).toBe(
+      "application-reuse-probe#2:first");
+    expect(await (await (await application.child()).direct("application-again")).identify()).toBe(
+      "application-again");
+    expect(await (await (await application.child()).direct("application-twice")).identify()).toBe(
+      "application-twice");
+  });
+
+  it("checks that the wire root remains reusable after the descendant failure", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("root-reuse-control");
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("root-reuse-control#2:first");
+    expect(await bundle.first.identify()).toBe("root-reuse-control#2:first");
+    const freshApplication = await api.application();
+    const freshChild = await freshApplication.child();
+    expect(await (await freshChild.direct("fresh-chain")).identify()).toBe(
+      "fresh-chain");
+  });
+
+  it("keeps a lazily reconstructed child reusable without a bundle", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    await wakeLayered(client, session, store);
+
+    const firstGrandchild = await child.direct("first-child-use");
+    expect(await firstGrandchild.identify()).toBe("first-child-use");
+    expect(await (await child.direct("second-child-use")).identify()).toBe(
+      "second-child-use");
+  });
+
+  it("keeps a lazily reconstructed application reusable without deeper replay", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    await wakeLayered(client, session, store);
+
+    const firstChild = await application.child();
+    expect(await (await firstChild.direct("through-first-child")).identify()).toBe(
+      "through-first-child");
+    expect(await (await (await application.child()).direct("second-application-use")).identify()).toBe(
+      "second-application-use");
+  });
+
+  it("checks whether one reconstructed terminal capability accepts two calls", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const child = await api.child();
+    const grandchild = await child.direct("terminal-twice");
+
+    // Control: the original exported capability is ordinarily reusable.
+    expect(await grandchild.identify()).toBe("terminal-twice");
+    expect(await grandchild.identify()).toBe("terminal-twice");
+
+    await wakeLayered(client, session, store);
+
+    expect(await grandchild.identify()).toBe("terminal-twice");
+    expect(await grandchild.identify()).toBe("terminal-twice");
+  });
+
+  it("checks the same two-call boundary for a root-returned bundled capability", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const bundle = await api.bundle("root-terminal-twice");
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("root-terminal-twice:first");
+    expect(await bundle.first.identify()).toBe("root-terminal-twice:first");
+    // The sibling has independent provenance and still gets its own first use.
+    expect(await bundle.second.identify()).toBe("root-terminal-twice:second");
+  });
+
+  it("keeps one cached reconstructed hook valid and reuses it", async () => {
+    const traceEvents: ObservedTraceEvent[] = [];
+    const { api, client, session, store } = await connectLayered();
+    const bundle = await api.bundle("cached-hook");
+    const restored = await wakeLayered(
+      client, session, store, new LayeredMetrics(), traceEvents);
+
+    expect(await bundle.first.identify()).toBe("cached-hook:first");
+    const afterFirst = restored.__experimental_debugState().exports.find(
+      (entry: any) => JSON.stringify(entry.provenance?.expr)
+        ?.includes("cached-hook") && entry.hasHook);
+    expect(afterFirst).toBeDefined();
+
+    expect(await bundle.first.identify()).toBe("cached-hook:first");
+    const afterSecond = restored.__experimental_debugState().exports.find(
+      (entry: any) => entry.id === afterFirst.id);
+    expect(afterSecond.hasHook).toBe(true);
+    expect(afterSecond.hookIdentity?.hookObjectId).toBe(
+      afterFirst.hookIdentity?.hookObjectId);
+
+    const restoresOfThisExport = traceEvents.filter(event =>
+      event.source === "rpc" &&
+      event.phase === "getOrRestoreExportHook.replay" &&
+      event.detail?.exportId === afterFirst.id);
+    expect(restoresOfThisExport).toHaveLength(1);
+  });
+
+  it("supports queued and later sequential calls on the same restored capability", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const bundle = await api.bundle("concurrent-calls");
+    await wakeLayered(client, session, store);
+
+    const first = bundle.first.identify();
+    const second = bundle.first.identify();
+    expect(await Promise.all([first, second])).toEqual([
+      "concurrent-calls:first",
+      "concurrent-calls:first",
+    ]);
+    expect(await bundle.first.identify()).toBe("concurrent-calls:first");
+    expect(await bundle.first.identify()).toBe("concurrent-calls:first");
+  });
+});
+
 describe("lazy restoration of grandchildren returned by a child capability", () => {
   it("restores a grandchild returned directly by a child", async () => {
     const { api, client, session, store } = await connectLayered();
     const child = await api.child();
     const grandchild = await child.direct("direct");
     expect(await grandchild.identify()).toBe("direct");
+    expect(await grandchild.identify()).toBe("direct");
 
     await wakeLayered(client, session, store);
 
+    expect(await grandchild.identify()).toBe("direct");
     expect(await grandchild.identify()).toBe("direct");
   });
 
@@ -999,6 +1421,8 @@ describe("lazy restoration of grandchildren returned by a child capability", () 
     await wakeLayered(client, session, store);
 
     expect(await bundle.first.identify()).toBe("root:first");
+    expect(await bundle.first.identify()).toBe("root:first");
+    expect(await bundle.second.identify()).toBe("root:second");
     expect(await bundle.second.identify()).toBe("root:second");
   });
 
@@ -1007,11 +1431,13 @@ describe("lazy restoration of grandchildren returned by a child capability", () 
     const child = await api.child();
     const result = await child.record("record");
     expect(await result.grandchild.identify()).toBe("record");
+    expect(await result.grandchild.identify()).toBe("record");
 
     await wakeLayered(client, session, store);
 
     // RED: lazy restoration maps into an asynchronously reconstructed child
     // result after the temporary base payload has already been disposed.
+    expect(await result.grandchild.identify()).toBe("record");
     expect(await result.grandchild.identify()).toBe("record");
   });
 
@@ -1025,6 +1451,8 @@ describe("lazy restoration of grandchildren returned by a child capability", () 
     // RED: multiplicity is not required to trigger the defect, but both saved
     // field paths must ultimately be rebound independently.
     expect(await bundle.first.identify()).toBe("child:first");
+    expect(await bundle.first.identify()).toBe("child:first");
+    expect(await bundle.second.identify()).toBe("child:second");
     expect(await bundle.second.identify()).toBe("child:second");
   });
 
@@ -1039,9 +1467,12 @@ describe("lazy restoration of grandchildren returned by a child capability", () 
     await wakeLayered(client, session, store);
 
     expect(await bundle.first.identify()).toBe("bilateral:first");
+    expect(await bundle.first.identify()).toBe("bilateral:first");
+    expect(await bundle.second.identify()).toBe("bilateral:second");
     expect(await bundle.second.identify()).toBe("bilateral:second");
     await bundle.first.notify("after");
-    expect(participant.messages).toEqual(["before", "after"]);
+    await bundle.first.notify("after-again");
+    expect(participant.messages).toEqual(["before", "after", "after-again"]);
   });
 });
 
@@ -1055,6 +1486,7 @@ describe("lazy restoration through a returned application root and child", () =>
     await wakeLayered(client, session, store);
 
     expect(await grandchild.identify()).toBe("deep-direct");
+    expect(await grandchild.identify()).toBe("deep-direct");
   });
 
   it("restores bundled capabilities returned by the application root", async () => {
@@ -1065,6 +1497,8 @@ describe("lazy restoration through a returned application root and child", () =>
     await wakeLayered(client, session, store);
 
     expect(await bundle.first.identify()).toBe("application:first");
+    expect(await bundle.first.identify()).toBe("application:first");
+    expect(await bundle.second.identify()).toBe("application:second");
     expect(await bundle.second.identify()).toBe("application:second");
   });
 
@@ -1074,10 +1508,12 @@ describe("lazy restoration through a returned application root and child", () =>
     const child = await application.child();
     const result = await child.record("deep-record");
     expect(await result.grandchild.identify()).toBe("deep-record");
+    expect(await result.grandchild.identify()).toBe("deep-record");
 
     await wakeLayered(client, session, store);
 
     // A single mapped field at this depth remains a passing control.
+    expect(await result.grandchild.identify()).toBe("deep-record");
     expect(await result.grandchild.identify()).toBe("deep-record");
   });
 
@@ -1090,6 +1526,7 @@ describe("lazy restoration through a returned application root and child", () =>
     await wakeLayered(client, session, store);
 
     expect(await bundle.first.identify()).toBe("deep-first-only:first");
+    expect(await bundle.first.identify()).toBe("deep-first-only:first");
   });
 
   it("restores the second deep bundled capability when used independently", async () => {
@@ -1100,6 +1537,7 @@ describe("lazy restoration through a returned application root and child", () =>
 
     await wakeLayered(client, session, store);
 
+    expect(await bundle.second.identify()).toBe("deep-second-only:second");
     expect(await bundle.second.identify()).toBe("deep-second-only:second");
   });
 
@@ -1114,6 +1552,8 @@ describe("lazy restoration through a returned application root and child", () =>
     // RED: each field restores independently, but using the first sibling
     // disposes shared temporary state that the second sibling still needs.
     expect(await bundle.first.identify()).toBe("deep-bundle:first");
+    expect(await bundle.first.identify()).toBe("deep-bundle:first");
+    expect(await bundle.second.identify()).toBe("deep-bundle:second");
     expect(await bundle.second.identify()).toBe("deep-bundle:second");
   });
 
@@ -1129,9 +1569,12 @@ describe("lazy restoration through a returned application root and child", () =>
     await wakeLayered(client, session, store);
 
     expect(await bundle.first.identify()).toBe("deep-bilateral:first");
+    expect(await bundle.first.identify()).toBe("deep-bilateral:first");
+    expect(await bundle.second.identify()).toBe("deep-bilateral:second");
     expect(await bundle.second.identify()).toBe("deep-bilateral:second");
     await bundle.first.notify("after");
-    expect(participant.messages).toEqual(["before", "after"]);
+    await bundle.first.notify("after-again");
+    expect(participant.messages).toEqual(["before", "after", "after-again"]);
   });
 });
 
@@ -1151,6 +1594,7 @@ describe("lazy restoration retains only live export families", () => {
 
     const restored = await wakeLayered(client, session, store, metrics);
 
+    expect(await bundle.first.identify()).toBe("released-before#2:first");
     expect(await bundle.first.identify()).toBe("released-before#2:first");
     expect(metrics.trackedBundleCalls).toBe(2);
     expect(restored.__experimental_snapshot().exports.length).toBe(exportsAfterRelease);
@@ -1190,6 +1634,7 @@ describe("lazy restoration retains only live export families", () => {
     expect(restored.__experimental_snapshot().exports.length).toBe(exportsBeforeRelease - 1);
 
     expect(await bundle.first.identify()).toBe("released-after-wake#2:first");
+    expect(await bundle.first.identify()).toBe("released-after-wake#2:first");
     expect(metrics.trackedBundleCalls).toBe(2);
   });
 
@@ -1204,7 +1649,9 @@ describe("lazy restoration retains only live export families", () => {
     await wakeLayered(client, session, store, metrics);
 
     expect(await firstCall.first.identify()).toBe("same-input#3:first");
+    expect(await firstCall.first.identify()).toBe("same-input#3:first");
     expect(metrics.trackedBundleCalls).toBe(3);
+    expect(await secondCall.first.identify()).toBe("same-input#4:first");
     expect(await secondCall.first.identify()).toBe("same-input#4:first");
     expect(metrics.trackedBundleCalls).toBe(4);
   });
@@ -1219,6 +1666,8 @@ describe("lazy restoration retains only live export families", () => {
     await wakeLayered(client, session, store, metrics);
 
     expect(await bundle.first.identify()).toBe("one-family#2:first");
+    expect(await bundle.first.identify()).toBe("one-family#2:first");
+    expect(await bundle.second.identify()).toBe("one-family#2:second");
     expect(await bundle.second.identify()).toBe("one-family#2:second");
     expect(metrics.trackedBundleCalls).toBe(2);
   });
@@ -1233,9 +1682,11 @@ describe("lazy restoration retains only live export families", () => {
 
     const firstRestore = await wakeLayered(client, session, store, metrics);
     expect(await bundle.first.identify()).toBe("repeated-wake#2:first");
+    expect(await bundle.first.identify()).toBe("repeated-wake#2:first");
     const selectedExportCount = firstRestore.__experimental_snapshot().exports.length;
 
     const secondRestore = await wakeLayered(client, firstRestore, store, metrics);
+    expect(await bundle.first.identify()).toBe("repeated-wake#3:first");
     expect(await bundle.first.identify()).toBe("repeated-wake#3:first");
     expect(secondRestore.__experimental_snapshot().exports.length).toBe(selectedExportCount);
     expect(metrics.trackedBundleCalls).toBe(3);
@@ -1325,8 +1776,14 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     [Symbol.dispose]() {
       this.teardown();
     }
+    ping(): string {
+      return "subscription";
+    }
   }
   class PersonaTarget extends RpcTarget {
+    ping(): string {
+      return "persona";
+    }
     // collection-sync stream(): dup the client writer (params are disposed on
     // return), hold the dup in the Subscription's teardown.
     avatar(writer: any): Subscription {
@@ -1353,6 +1810,9 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
   }
   // Variant where avatar does NOT dup the writer (isolates whether dup is the cause).
   class PersonaNoDupTarget extends RpcTarget {
+    ping(): string {
+      return "persona";
+    }
     avatar(_writer: any): Subscription {
       return new Subscription(() => {});
     }
@@ -1384,7 +1844,7 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
   // from the snapshot in a fresh server session. Returns the wake outcome.
   async function runWake(
     makeMain: () => RpcTarget,
-    exercise: (api: any, held: unknown[]) => Promise<void>,
+    exercise: (api: any, held: unknown[]) => Promise<() => Promise<void>>,
   ): Promise<{ ok: boolean; reason: string }> {
     const store = new CountingSessionStore();
     const security = __experimental_newWebCryptoSnapshotSecurity("held-caps-secret");
@@ -1399,10 +1859,12 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     server.addEventListener("message", (e) => session.handleMessage(e.data));
     const api = newWebSocketRpcSession<any>(client as unknown as WebSocket);
     const held: unknown[] = [];
-    await exercise(api, held);
+    const verifyRetainedCapabilities = await exercise(api, held);
     await new Promise((r) => setTimeout(r, 0));
     expect(store.snapshots.has(session.sessionId)).toBe(true);
-    const { server: server2 } = createFakeWebSocketPair();
+    const server2 = new FakeWebSocket();
+    client.connect(server2);
+    server2.connect(client);
     const restored = await __experimental_newHibernatableWebSocketRpcSession(
       server2 as unknown as WebSocket,
       makeMain(),
@@ -1413,6 +1875,11 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
         snapshotSecurityAssociatedData: assoc,
       },
     );
+    if (restored) {
+      server2.addEventListener("message", (e) => restored.handleMessage(e.data));
+      await verifyRetainedCapabilities();
+      await verifyRetainedCapabilities();
+    }
     void held; // keep stubs referenced through the wake
     return { ok: !!restored, reason: server2.closeReason };
   }
@@ -1421,7 +1888,13 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     const r = await runWake(() => new MainTarget(), async (api, held) => {
       const persona = api.persona();
       const files = api.files();
-      held.push(persona, files, await persona.avatar(new WriterTarget()));
+      const subscription = await persona.avatar(new WriterTarget());
+      held.push(persona, files, subscription);
+      return async () => {
+        expect(await persona.ping()).toBe("persona");
+        expect(await files.ping()).toBe("files");
+        expect(await subscription.ping()).toBe("subscription");
+      };
     });
     console.log("[REPRO]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
     expect(r.reason).not.toBe("stale session");
@@ -1430,7 +1903,13 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
 
   it("control A — hold persona + files only, NO avatar stream", async () => {
     const r = await runWake(() => new MainTarget(), async (api, held) => {
-      held.push(api.persona(), api.files());
+      const persona = api.persona();
+      const files = api.files();
+      held.push(persona, files);
+      return async () => {
+        expect(await persona.ping()).toBe("persona");
+        expect(await files.ping()).toBe("files");
+      };
     });
     console.log("[A no-stream]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
   });
@@ -1438,14 +1917,27 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
   it("control B — nested avatar stream WITHOUT writer.dup()", async () => {
     const r = await runWake(() => new MainNoDupTarget(), async (api, held) => {
       const persona = api.persona();
-      held.push(persona, api.files(), await persona.avatar(new WriterTarget()));
+      const files = api.files();
+      const subscription = await persona.avatar(new WriterTarget());
+      held.push(persona, files, subscription);
+      return async () => {
+        expect(await persona.ping()).toBe("persona");
+        expect(await files.ping()).toBe("files");
+        expect(await subscription.ping()).toBe("subscription");
+      };
     });
     console.log("[B no-dup]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
   });
 
   it("control C — avatar stream WITH dup but NO persona nesting (flat on main)", async () => {
     const r = await runWake(() => new MainFlatTarget(), async (api, held) => {
-      held.push(api.files(), await api.avatar(new WriterTarget()));
+      const files = api.files();
+      const subscription = await api.avatar(new WriterTarget());
+      held.push(files, subscription);
+      return async () => {
+        expect(await files.ping()).toBe("files");
+        expect(await subscription.ping()).toBe("subscription");
+      };
     });
     console.log("[C flat-dup]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
   });
@@ -1453,7 +1945,14 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
   it("control D — nested+dup but AWAIT persona() first (base resolves to a NEGATIVE export)", async () => {
     const r = await runWake(() => new MainTarget(), async (api, held) => {
       const persona = await api.persona(); // AWAIT → persona settles to a negative export
-      held.push(persona, api.files(), await persona.avatar(new WriterTarget()));
+      const files = api.files();
+      const subscription = await persona.avatar(new WriterTarget());
+      held.push(persona, files, subscription);
+      return async () => {
+        expect(await persona.ping()).toBe("persona");
+        expect(await files.ping()).toBe("files");
+        expect(await subscription.ping()).toBe("subscription");
+      };
     });
     console.log("[D await-persona]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
   });
