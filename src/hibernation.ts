@@ -6,14 +6,6 @@ import type { PropertyPath } from "./core.js";
 
 export type RpcSessionExportProvenance = {
   expr: unknown;
-  /**
-   * Identifies the exact call-result occurrence that produced this export.
-   * Sibling capabilities from that one result share the id, allowing lazy
-   * restoration to evaluate the call once and derive every still-live sibling
-   * before releasing the temporary result. This is deliberately not derived
-   * from `expr`: two identical-looking calls are distinct restoration families.
-   */
-  familyId?: number;
   captures?: ["import", number][];
   instructions?: unknown[];
   path?: PropertyPath;

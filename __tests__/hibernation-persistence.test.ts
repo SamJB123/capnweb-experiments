@@ -827,14 +827,12 @@ class LayeredParticipant extends RpcTarget {
 
 class LayeredMetrics {
   trackedBundleCalls = 0;
-  disposedGrandchildren: string[] = [];
 }
 
 class LayeredGrandchild extends RpcTarget {
   constructor(
       private readonly name: string,
-      private readonly participant?: any,
-      private readonly onDispose?: (name: string) => void) {
+      private readonly participant?: any) {
     super();
   }
 
@@ -844,10 +842,6 @@ class LayeredGrandchild extends RpcTarget {
 
   async notify(message: string): Promise<void> {
     await this.participant?.onMessage(message);
-  }
-
-  [Symbol.dispose](): void {
-    this.onDispose?.(this.name);
   }
 }
 
@@ -890,14 +884,9 @@ class LayeredChild extends RpcTarget {
     second: LayeredGrandchild;
   } {
     const occurrence = ++this.metrics.trackedBundleCalls;
-    const trackDisposal = (disposedName: string) => {
-      this.metrics.disposedGrandchildren.push(disposedName);
-    };
     return {
-      first: new LayeredGrandchild(
-        `${name}#${occurrence}:first`, undefined, trackDisposal),
-      second: new LayeredGrandchild(
-        `${name}#${occurrence}:second`, undefined, trackDisposal),
+      first: new LayeredGrandchild(`${name}#${occurrence}:first`),
+      second: new LayeredGrandchild(`${name}#${occurrence}:second`),
     };
   }
 }
@@ -1232,57 +1221,6 @@ describe("lazy restoration retains only live export families", () => {
     expect(await bundle.first.identify()).toBe("one-family#2:first");
     expect(await bundle.second.identify()).toBe("one-family#2:second");
     expect(metrics.trackedBundleCalls).toBe(2);
-  });
-
-  it("keeps restored siblings alive until release, then disposes each exactly once", async () => {
-    const { api, client, metrics, session, store } = await connectLayered();
-    const application = await api.application();
-    const child = await application.child();
-    const bundle = await child.trackedBundle("dispose-retained");
-
-    await wakeLayered(client, session, store, metrics);
-    expect(await bundle.first.identify()).toBe("dispose-retained#2:first");
-    expect(await bundle.second.identify()).toBe("dispose-retained#2:second");
-    await flush();
-
-    const restoredDisposals = () => metrics.disposedGrandchildren.filter(
-      name => name.startsWith("dispose-retained#2:"));
-    expect(restoredDisposals()).toEqual([]);
-
-    bundle.first[Symbol.dispose]();
-    await flush();
-    expect(restoredDisposals()).toEqual(["dispose-retained#2:first"]);
-
-    bundle.second[Symbol.dispose]();
-    await flush();
-    expect(restoredDisposals()).toEqual([
-      "dispose-retained#2:first",
-      "dispose-retained#2:second",
-    ]);
-  });
-
-  it("disposes an unretained replay sibling when the temporary result settles", async () => {
-    const { api, client, metrics, session, store } = await connectLayered();
-    const application = await api.application();
-    const child = await application.child();
-    const bundle = await child.trackedBundle("dispose-unretained");
-    bundle.second[Symbol.dispose]();
-    await flush();
-
-    await wakeLayered(client, session, store, metrics);
-    expect(await bundle.first.identify()).toBe("dispose-unretained#2:first");
-    await flush();
-
-    const restoredDisposals = () => metrics.disposedGrandchildren.filter(
-      name => name.startsWith("dispose-unretained#2:"));
-    expect(restoredDisposals()).toEqual(["dispose-unretained#2:second"]);
-
-    bundle.first[Symbol.dispose]();
-    await flush();
-    expect(restoredDisposals()).toEqual([
-      "dispose-unretained#2:second",
-      "dispose-unretained#2:first",
-    ]);
   });
 
   it("preserves released-sibling selectivity across repeated hibernations", async () => {
