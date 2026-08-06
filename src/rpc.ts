@@ -620,6 +620,10 @@ class RpcSessionImpl implements Importer, Exporter {
   // How many promises is our peer expecting us to resolve?
   private pullCount = 0;
   private currentNegativeExportProvenanceExpr?: unknown;
+  // The internal identity of the exact incoming call result currently being
+  // serialized. Every negative capability exported from that result belongs
+  // to this restoration family, even when nested deeply in the returned value.
+  private currentResolveFamilyId?: number;
   // While resolving a replay-recorded call's result, the replay record being
   // populated. Every negative export created during that resolve (each returned
   // capability, however deeply nested) records its id here, so restore knows the
@@ -747,6 +751,9 @@ class RpcSessionImpl implements Importer, Exporter {
             let mapProgram = __experimental_recordInputPath(path ?? []);
             return {
               expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
+              ...(this.currentResolveFamilyId !== undefined
+                ? {familyId: this.currentResolveFamilyId}
+                : {}),
               captures: mapProgram.captures,
               instructions: mapProgram.instructions,
             };
@@ -776,6 +783,9 @@ class RpcSessionImpl implements Importer, Exporter {
           let mapProgram = __experimental_recordInputPath(path ?? []);
           return {
             expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
+            ...(this.currentResolveFamilyId !== undefined
+              ? {familyId: this.currentResolveFamilyId}
+              : {}),
             captures: mapProgram.captures,
             instructions: mapProgram.instructions,
           };
@@ -886,7 +896,11 @@ class RpcSessionImpl implements Importer, Exporter {
         payload => {
           const previousExpr = this.currentNegativeExportProvenanceExpr;
           const previousReplay = this.currentResolveReplay;
+          const previousFamilyId = this.currentResolveFamilyId;
           this.currentNegativeExportProvenanceExpr = exp.provenance?.expr ?? exp.sourceExpr;
+          this.currentResolveFamilyId = exportId >= 0 && exp.sourceExpr !== undefined
+            ? exportId
+            : undefined;
           // If this call was replay-recorded, every negative export created while
           // devaluing its result (each returned capability, however deeply nested)
           // registers its id on the replay record via exportStub/exportPromise —
@@ -902,6 +916,7 @@ class RpcSessionImpl implements Importer, Exporter {
           } finally {
             this.currentNegativeExportProvenanceExpr = previousExpr;
             this.currentResolveReplay = previousReplay;
+            this.currentResolveFamilyId = previousFamilyId;
           }
           this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
           this.send(["resolve", exportId, value]);
@@ -1580,14 +1595,11 @@ class RpcSessionImpl implements Importer, Exporter {
     };
   }
 
-  /**
-   * Derive an independent hook for a restored export from a pre-evaluated call
-   * result `base`, navigating by the export's provenance (map instructions, a
-   * property path, or the bare result). Does NOT consume `base`: the map/get/dup
-   * paths all deep-copy or pipeline, so ONE evaluated result can serve any number
-   * of exports a single call produced (the caller disposes `base` once afterward).
-   */
-  private deriveExportHookFromBase(provenance: RpcSessionExportProvenance, base: StubHook): StubHook {
+  /** Derive one retained export from its producing call result. */
+  private deriveExportHookFromBase(
+      provenance: RpcSessionExportProvenance,
+      base: StubHook,
+      temporaryBases?: StubHook[]): StubHook {
     if (provenance.instructions) {
       const captures = (provenance.captures ?? []).map(captureExpr => {
         const capturePayload = new Evaluator(this).evaluate(cloneRpcExpr(captureExpr));
@@ -1608,9 +1620,13 @@ class RpcSessionImpl implements Importer, Exporter {
           return captureHook.dup();
         }
       });
-      // `base.map` unwraps any root promise itself (followPath) and applyMap
-      // deep-copies a plain value, so this never consumes `base`.
-      return base.map([], captures, cloneRpcExpr(provenance.instructions));
+      // Lazy family restoration may still need `base` while promise-backed
+      // sibling derivations settle. Eager import replay has an established
+      // ownership contract in which mapping consumes the shared result, so do
+      // not alter that path's handle-disposal semantics.
+      const mapBase = temporaryBases ? base.dup() : base;
+      temporaryBases?.push(mapBase);
+      return mapBase.map([], captures, cloneRpcExpr(provenance.instructions));
     } else if (provenance.path && provenance.path.length > 0) {
       return base.get(provenance.path);
     } else {
@@ -1626,18 +1642,77 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (!entry.hook) {
       if (entry.provenance) {
-        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(entry.provenance.expr)));
-        try {
-          entry.hook = this.deriveExportHookFromBase(entry.provenance, base);
-        } finally {
-          base.dispose();
+        const familyId = entry.provenance.familyId;
+        const members: Array<[ExportId, ExportTableEntry]> = [];
+
+        // A snapshot contains only exports the peer still retained. Therefore
+        // this grouping restores every *live* sibling from this exact result,
+        // while released siblings (and released families) remain absent. Older
+        // snapshots have no family id and retain the legacy one-export behavior.
+        if (familyId === undefined) {
+          members.push([exportId, entry]);
+        } else {
+          for (const key in this.exports) {
+            const memberId = Number(key);
+            const member = this.exports[memberId];
+            if (memberId < 0 && member && !member.hook &&
+                member.provenance?.familyId === familyId) {
+              members.push([memberId, member]);
+            }
+          }
         }
-        this.reverseExports.set(entry.hook, exportId);
-        this.trace("getOrRestoreExportHook.replay", {
-          exportId,
-          pathLength: entry.provenance.path?.length ?? 0,
-          instructionCount: entry.provenance.instructions?.length ?? 0,
-          hookType: entry.hook.constructor?.name ?? null,
+        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel)
+          .evaluate(cloneRpcExpr(entry.provenance.expr)));
+        const bound: Array<[ExportId, ExportTableEntry, StubHook]> = [];
+        const temporaryBases: StubHook[] = [];
+        try {
+          for (const [memberId, member] of members) {
+            const hook = this.deriveExportHookFromBase(
+                member.provenance!, base, temporaryBases);
+            member.hook = hook;
+            this.reverseExports.set(hook, memberId);
+            bound.push([memberId, member, hook]);
+            this.trace("getOrRestoreExportHook.replay", {
+              exportId: memberId,
+              familyId: familyId ?? null,
+              pathLength: member.provenance!.path?.length ?? 0,
+              instructionCount: member.provenance!.instructions?.length ?? 0,
+              hookType: hook.constructor?.name ?? null,
+            });
+          }
+        } catch (error) {
+          // Never leave a partially-restored family installed. A later use may
+          // safely retry the exact producing call from a clean state.
+          for (const [, member, hook] of bound) {
+            this.reverseExports.delete(hook);
+            member.hook = undefined;
+            hook.dispose();
+          }
+          for (const temporaryBase of temporaryBases) temporaryBase.dispose();
+          base.dispose();
+          throw error;
+        }
+
+        // The derivations above can be promise-backed. Mapping such a result
+        // finishes asynchronously and still depends on `base`; disposing it
+        // immediately races those maps and can invalidate the shared parent
+        // before every retained sibling is extracted. Pull each derived hook
+        // only far enough to settle that extraction, then release the one
+        // temporary replay result. The hooks keep their own resulting payloads.
+        const derivationsSettled = bound.map(([, , hook]) => {
+          try {
+            return Promise.resolve(hook.pull()).then(() => undefined);
+          } catch (error) {
+            return Promise.reject(error);
+          }
+        });
+        void Promise.allSettled(derivationsSettled).then(() => {
+          for (const temporaryBase of temporaryBases) temporaryBase.dispose();
+          base.dispose();
+          this.trace("getOrRestoreExportHook.familySettled", {
+            familyId: familyId ?? null,
+            exportCount: bound.length,
+          });
         });
       } else {
         throw new Error(`Export ${exportId} can't be restored after hibernation because it has no provenance.`);
