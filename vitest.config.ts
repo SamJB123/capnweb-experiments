@@ -36,7 +36,11 @@ export default defineConfig({
       {
         test: {
           name: 'workerd',
-          include: ['__tests__/index.test.ts', '__tests__/workerd.test.ts'],
+          include: [
+            '__tests__/index.test.ts',
+            '__tests__/workerd.test.ts',
+            '__tests__/hibernation-persistence.test.ts',
+          ],
           pool: '@cloudflare/vitest-pool-workers',
           poolOptions: {
             workers: {

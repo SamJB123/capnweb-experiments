@@ -31,7 +31,10 @@
       "Bash(npm run *)",
       "Bash(npm install *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/@tanstack/db/package.json'\\).version\\)\")",
+      "Bash(node /private/tmp/claude-501/-Users-sambide-GitHub-capnweb-experimental/7a6d8d18-9f58-4585-876f-38e7422a30bc/scratchpad/meter-repro.mjs)",
+      "Bash(pnpm tsx *)"
     ]
   }
 }

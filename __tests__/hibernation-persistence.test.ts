@@ -13,6 +13,7 @@ import {
   type HibernatableSessionStore,
   type HibernatableStoredSnapshot,
 } from "../src/index.js";
+import { createCborCodec } from "../src/codec/cbor/index.js";
 
 interface EchoApi {
   echo(value: string): string;
@@ -49,7 +50,7 @@ class CountingSessionStore implements HibernatableSessionStore {
 type Listener = (event: any) => void;
 
 class FakeWebSocket {
-  readonly sent: string[] = [];
+  readonly sent: unknown[] = [];
   serializeAttachmentCount = 0;
   closeCount = 0;
   closeReason = "";
@@ -69,10 +70,13 @@ class FakeWebSocket {
     this.listeners.set(type, listeners);
   }
 
-  send(message: string): void {
+  send(message: unknown): void {
     this.sent.push(message);
+    const delivered = message instanceof Uint8Array
+      ? message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength)
+      : message;
     queueMicrotask(() => {
-      this.peer?.emit("message", { data: message });
+      this.peer?.emit("message", { data: delivered });
     });
   }
 
@@ -801,6 +805,307 @@ describe("__experimental_newWebCryptoSnapshotSecurity", () => {
       server2 as unknown as WebSocket, new EchoTarget(),
       { sessionStore: store, sessionId: session.sessionId, snapshotSecurity: security, snapshotSecurityAssociatedData: { u: "1" } });
     expect(restored).toBeUndefined(); // tampered snapshot rejected, fail-closed
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Lazy provenance through a returned child capability.
+//
+// These tests distinguish capability depth from structured-result traversal.
+// The first, shallower matrix is deliberately all green. The second adds the
+// wire-level wrapper used by brokered systems such as Room Service and contains
+// the red sibling-restoration requirement discovered in the real application
+// topology.
+// ───────────────────────────────────────────────────────────────────────────
+
+class LayeredParticipant extends RpcTarget {
+  readonly messages: string[] = [];
+  onMessage(message: string): void {
+    this.messages.push(message);
+  }
+}
+
+class LayeredGrandchild extends RpcTarget {
+  constructor(
+      private readonly name: string,
+      private readonly participant?: any) {
+    super();
+  }
+
+  identify(): string {
+    return this.name;
+  }
+
+  async notify(message: string): Promise<void> {
+    await this.participant?.onMessage(message);
+  }
+}
+
+class LayeredChild extends RpcTarget {
+  direct(name: string): LayeredGrandchild {
+    return new LayeredGrandchild(name);
+  }
+
+  record(name: string): { grandchild: LayeredGrandchild } {
+    return { grandchild: new LayeredGrandchild(name) };
+  }
+
+  bundle(name: string): {
+    first: LayeredGrandchild;
+    second: LayeredGrandchild;
+  } {
+    return {
+      first: new LayeredGrandchild(`${name}:first`),
+      second: new LayeredGrandchild(`${name}:second`),
+    };
+  }
+
+  bilateralBundle(name: string, participant: any): {
+    first: LayeredGrandchild;
+    second: LayeredGrandchild;
+  } {
+    const held = participant.dup();
+    return {
+      first: new LayeredGrandchild(`${name}:first`, held),
+      second: new LayeredGrandchild(`${name}:second`),
+    };
+  }
+}
+
+class LayeredSurface extends RpcTarget {
+  child(): LayeredChild {
+    return new LayeredChild();
+  }
+
+  bundle(name: string): {
+    first: LayeredGrandchild;
+    second: LayeredGrandchild;
+  } {
+    return {
+      first: new LayeredGrandchild(`${name}:first`),
+      second: new LayeredGrandchild(`${name}:second`),
+    };
+  }
+}
+
+class LayeredApplication extends LayeredSurface {}
+
+class LayeredRoot extends LayeredSurface {
+  application(): LayeredApplication {
+    return new LayeredApplication();
+  }
+}
+
+async function connectLayered() {
+  const store = new CountingSessionStore();
+  const { client, server } = createFakeWebSocketPair();
+  const session = await __experimental_newHibernatableWebSocketRpcSession(
+    server as unknown as WebSocket,
+    new LayeredRoot(),
+    {
+      sessionStore: store,
+      codec: createCborCodec({
+        stateful: true,
+        optimizeEnvelope: true,
+        structuredClone: true,
+      }),
+    },
+  );
+  if (!session) throw new Error("failed to create layered session");
+  server.addEventListener("message", (event) => session.handleMessage(event.data));
+  const api = newWebSocketRpcSession<LayeredRoot>(
+    client as unknown as WebSocket,
+    undefined,
+    {
+      codec: createCborCodec({
+        stateful: true,
+        optimizeEnvelope: true,
+        structuredClone: true,
+      }),
+    },
+  );
+  return { api, client, session, store };
+}
+
+async function wakeLayered(
+    client: FakeWebSocket,
+    session: any,
+    store: CountingSessionStore) {
+  const sessionId: string = session.sessionId;
+  store.snapshots.set(sessionId, structuredClone(session.__experimental_snapshot()));
+
+  const server = new FakeWebSocket();
+  client.connect(server);
+  server.connect(client);
+  const restored = await __experimental_newHibernatableWebSocketRpcSession(
+    server as unknown as WebSocket,
+    new LayeredRoot(),
+    {
+      sessionStore: store,
+      sessionId,
+      codec: createCborCodec({
+        stateful: true,
+        optimizeEnvelope: true,
+        structuredClone: true,
+      }),
+    },
+  );
+  if (!restored) throw new Error("failed to restore layered session");
+  server.addEventListener("message", (event) => restored.handleMessage(event.data));
+}
+
+describe("lazy restoration of grandchildren returned by a child capability", () => {
+  it("restores a grandchild returned directly by a child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const child = await api.child();
+    const grandchild = await child.direct("direct");
+    expect(await grandchild.identify()).toBe("direct");
+
+    await wakeLayered(client, session, store);
+
+    expect(await grandchild.identify()).toBe("direct");
+  });
+
+  it("restores bundled children returned directly by the root", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const bundle = await api.bundle("root");
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("root:first");
+    expect(await bundle.second.identify()).toBe("root:second");
+  });
+
+  it("restores one record-wrapped grandchild returned by a child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const child = await api.child();
+    const result = await child.record("record");
+    expect(await result.grandchild.identify()).toBe("record");
+
+    await wakeLayered(client, session, store);
+
+    // RED: lazy restoration maps into an asynchronously reconstructed child
+    // result after the temporary base payload has already been disposed.
+    expect(await result.grandchild.identify()).toBe("record");
+  });
+
+  it("restores every bundled grandchild returned by a child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const child = await api.child();
+    const bundle = await child.bundle("child");
+
+    await wakeLayered(client, session, store);
+
+    // RED: multiplicity is not required to trigger the defect, but both saved
+    // field paths must ultimately be rebound independently.
+    expect(await bundle.first.identify()).toBe("child:first");
+    expect(await bundle.second.identify()).toBe("child:second");
+  });
+
+  it("restores bundled grandchildren when the child call is bilateral", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const child = await api.child();
+    const participant = new LayeredParticipant();
+    const bundle = await child.bilateralBundle("bilateral", participant);
+    await bundle.first.notify("before");
+    expect(participant.messages).toEqual(["before"]);
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("bilateral:first");
+    expect(await bundle.second.identify()).toBe("bilateral:second");
+    await bundle.first.notify("after");
+    expect(participant.messages).toEqual(["before", "after"]);
+  });
+});
+
+describe("lazy restoration through a returned application root and child", () => {
+  it("restores a capability returned directly by the application child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const grandchild = await child.direct("deep-direct");
+
+    await wakeLayered(client, session, store);
+
+    expect(await grandchild.identify()).toBe("deep-direct");
+  });
+
+  it("restores bundled capabilities returned by the application root", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const bundle = await application.bundle("application");
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("application:first");
+    expect(await bundle.second.identify()).toBe("application:second");
+  });
+
+  it("restores one record-wrapped capability returned by the application child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const result = await child.record("deep-record");
+    expect(await result.grandchild.identify()).toBe("deep-record");
+
+    await wakeLayered(client, session, store);
+
+    // A single mapped field at this depth remains a passing control.
+    expect(await result.grandchild.identify()).toBe("deep-record");
+  });
+
+  it("restores the first deep bundled capability when used independently", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.bundle("deep-first-only");
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("deep-first-only:first");
+  });
+
+  it("restores the second deep bundled capability when used independently", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.bundle("deep-second-only");
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.second.identify()).toBe("deep-second-only:second");
+  });
+
+  it("restores every bundled capability returned by the application child", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.bundle("deep-bundle");
+
+    await wakeLayered(client, session, store);
+
+    // RED: each field restores independently, but using the first sibling
+    // disposes shared temporary state that the second sibling still needs.
+    expect(await bundle.first.identify()).toBe("deep-bundle:first");
+    expect(await bundle.second.identify()).toBe("deep-bundle:second");
+  });
+
+  it("restores the deep bundle when its child request is bilateral", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const participant = new LayeredParticipant();
+    const bundle = await child.bilateralBundle("deep-bilateral", participant);
+    await bundle.first.notify("before");
+    expect(participant.messages).toEqual(["before"]);
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.first.identify()).toBe("deep-bilateral:first");
+    expect(await bundle.second.identify()).toBe("deep-bilateral:second");
+    await bundle.first.notify("after");
+    expect(participant.messages).toEqual(["before", "after"]);
   });
 });
 
