@@ -825,6 +825,10 @@ class LayeredParticipant extends RpcTarget {
   }
 }
 
+class LayeredMetrics {
+  trackedBundleCalls = 0;
+}
+
 class LayeredGrandchild extends RpcTarget {
   constructor(
       private readonly name: string,
@@ -842,6 +846,10 @@ class LayeredGrandchild extends RpcTarget {
 }
 
 class LayeredChild extends RpcTarget {
+  constructor(private readonly metrics = new LayeredMetrics()) {
+    super();
+  }
+
   direct(name: string): LayeredGrandchild {
     return new LayeredGrandchild(name);
   }
@@ -870,11 +878,26 @@ class LayeredChild extends RpcTarget {
       second: new LayeredGrandchild(`${name}:second`),
     };
   }
+
+  trackedBundle(name: string): {
+    first: LayeredGrandchild;
+    second: LayeredGrandchild;
+  } {
+    const occurrence = ++this.metrics.trackedBundleCalls;
+    return {
+      first: new LayeredGrandchild(`${name}#${occurrence}:first`),
+      second: new LayeredGrandchild(`${name}#${occurrence}:second`),
+    };
+  }
 }
 
 class LayeredSurface extends RpcTarget {
+  constructor(protected readonly metrics = new LayeredMetrics()) {
+    super();
+  }
+
   child(): LayeredChild {
-    return new LayeredChild();
+    return new LayeredChild(this.metrics);
   }
 
   bundle(name: string): {
@@ -892,16 +915,17 @@ class LayeredApplication extends LayeredSurface {}
 
 class LayeredRoot extends LayeredSurface {
   application(): LayeredApplication {
-    return new LayeredApplication();
+    return new LayeredApplication(this.metrics);
   }
 }
 
 async function connectLayered() {
   const store = new CountingSessionStore();
+  const metrics = new LayeredMetrics();
   const { client, server } = createFakeWebSocketPair();
   const session = await __experimental_newHibernatableWebSocketRpcSession(
     server as unknown as WebSocket,
-    new LayeredRoot(),
+    new LayeredRoot(metrics),
     {
       sessionStore: store,
       codec: createCborCodec({
@@ -924,13 +948,14 @@ async function connectLayered() {
       }),
     },
   );
-  return { api, client, session, store };
+  return { api, client, metrics, session, store };
 }
 
 async function wakeLayered(
     client: FakeWebSocket,
     session: any,
-    store: CountingSessionStore) {
+    store: CountingSessionStore,
+    metrics = new LayeredMetrics()) {
   const sessionId: string = session.sessionId;
   store.snapshots.set(sessionId, structuredClone(session.__experimental_snapshot()));
 
@@ -939,7 +964,7 @@ async function wakeLayered(
   server.connect(client);
   const restored = await __experimental_newHibernatableWebSocketRpcSession(
     server as unknown as WebSocket,
-    new LayeredRoot(),
+    new LayeredRoot(metrics),
     {
       sessionStore: store,
       sessionId,
@@ -952,6 +977,7 @@ async function wakeLayered(
   );
   if (!restored) throw new Error("failed to restore layered session");
   server.addEventListener("message", (event) => restored.handleMessage(event.data));
+  return restored;
 }
 
 describe("lazy restoration of grandchildren returned by a child capability", () => {
@@ -1106,6 +1132,113 @@ describe("lazy restoration through a returned application root and child", () =>
     expect(await bundle.second.identify()).toBe("deep-bilateral:second");
     await bundle.first.notify("after");
     expect(participant.messages).toEqual(["before", "after"]);
+  });
+});
+
+describe("lazy restoration retains only live export families", () => {
+  it("omits a sibling released before hibernation and restores only the retained sibling", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("released-before");
+    expect(metrics.trackedBundleCalls).toBe(1);
+
+    const exportsBeforeRelease = session.__experimental_snapshot().exports.length;
+    bundle.second[Symbol.dispose]();
+    await flush();
+    const exportsAfterRelease = session.__experimental_snapshot().exports.length;
+    expect(exportsAfterRelease).toBe(exportsBeforeRelease - 1);
+
+    const restored = await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("released-before#2:first");
+    expect(metrics.trackedBundleCalls).toBe(2);
+    expect(restored.__experimental_snapshot().exports.length).toBe(exportsAfterRelease);
+  });
+
+  it("does not replay an entirely released family", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("fully-released");
+    expect(metrics.trackedBundleCalls).toBe(1);
+
+    const exportsBeforeRelease = session.__experimental_snapshot().exports.length;
+    bundle.first[Symbol.dispose]();
+    bundle.second[Symbol.dispose]();
+    await flush();
+    expect(session.__experimental_snapshot().exports.length).toBe(exportsBeforeRelease - 2);
+
+    await wakeLayered(client, session, store, metrics);
+    await flush();
+
+    // No retained export requested the originating call, so waking alone must
+    // not recreate the family or increment its method-call count.
+    expect(metrics.trackedBundleCalls).toBe(1);
+  });
+
+  it("honors a sibling released after wake but before the family's first use", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("released-after-wake");
+
+    const restored = await wakeLayered(client, session, store, metrics);
+    const exportsBeforeRelease = restored.__experimental_snapshot().exports.length;
+    bundle.second[Symbol.dispose]();
+    await flush();
+    expect(restored.__experimental_snapshot().exports.length).toBe(exportsBeforeRelease - 1);
+
+    expect(await bundle.first.identify()).toBe("released-after-wake#2:first");
+    expect(metrics.trackedBundleCalls).toBe(2);
+  });
+
+  it("keeps identical-looking call occurrences as distinct restoration families", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const firstCall = await child.trackedBundle("same-input");
+    const secondCall = await child.trackedBundle("same-input");
+    expect(metrics.trackedBundleCalls).toBe(2);
+
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await firstCall.first.identify()).toBe("same-input#3:first");
+    expect(metrics.trackedBundleCalls).toBe(3);
+    expect(await secondCall.first.identify()).toBe("same-input#4:first");
+    expect(metrics.trackedBundleCalls).toBe(4);
+  });
+
+  it("re-evaluates one retained family once rather than once per sibling", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("one-family");
+    expect(metrics.trackedBundleCalls).toBe(1);
+
+    await wakeLayered(client, session, store, metrics);
+
+    expect(await bundle.first.identify()).toBe("one-family#2:first");
+    expect(await bundle.second.identify()).toBe("one-family#2:second");
+    expect(metrics.trackedBundleCalls).toBe(2);
+  });
+
+  it("preserves released-sibling selectivity across repeated hibernations", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.trackedBundle("repeated-wake");
+    bundle.second[Symbol.dispose]();
+    await flush();
+
+    const firstRestore = await wakeLayered(client, session, store, metrics);
+    expect(await bundle.first.identify()).toBe("repeated-wake#2:first");
+    const selectedExportCount = firstRestore.__experimental_snapshot().exports.length;
+
+    const secondRestore = await wakeLayered(client, firstRestore, store, metrics);
+    expect(await bundle.first.identify()).toBe("repeated-wake#3:first");
+    expect(secondRestore.__experimental_snapshot().exports.length).toBe(selectedExportCount);
+    expect(metrics.trackedBundleCalls).toBe(3);
   });
 });
 
