@@ -5,10 +5,12 @@
 import { describe, expect, it } from "vitest";
 import {
   RpcTarget,
+  RpcStub,
   newWebSocketRpcSession,
   __experimental_newHibernatableWebSocketRpcSession,
   __experimental_newWebCryptoSnapshotSecurity,
   type HibernatableSnapshotSecurity,
+  type HibernatableWebSocketSession,
   type HibernatableWebSocketOptions,
   type HibernatableSessionStore,
   type HibernatableStoredSnapshot,
@@ -34,7 +36,8 @@ class CountingSessionStore implements HibernatableSessionStore {
   }
 
   async save(sessionId: string, snapshot: HibernatableStoredSnapshot): Promise<void> {
-    this.snapshots.set(sessionId, structuredClone(snapshot));
+    const saved = structuredClone(snapshot);
+    this.snapshots.set(sessionId, saved);
     this.saveCounts.set(sessionId, (this.saveCounts.get(sessionId) ?? 0) + 1);
   }
 
@@ -896,6 +899,10 @@ class LayeredParticipant extends RpcTarget {
 
 class LayeredMetrics {
   trackedBundleCalls = 0;
+  fallibleBundleCalls = 0;
+  delayedBundleCalls = 0;
+  delayBundleResolution = false;
+  delayedBundleGate = Promise.withResolvers<void>();
   disposedGrandchildren: string[] = [];
 }
 
@@ -935,6 +942,43 @@ class LayeredGrandchild extends RpcTarget {
 
   [Symbol.dispose](): void {
     this.onDispose?.(this.name);
+  }
+}
+
+class ProjectCapability extends RpcTarget {
+  constructor(private readonly id: string) { super(); }
+  read(): string { return `project:${this.id}`; }
+}
+
+class DocumentDirectoryCapability extends RpcTarget {
+  constructor(private readonly id: string) { super(); }
+  list(): string[] { return [`document:${this.id}`]; }
+}
+
+class ActivityCapability extends RpcTarget {
+  constructor(private readonly id: string) { super(); }
+  latest(): string { return `activity:${this.id}`; }
+}
+
+class SideACapability extends RpcTarget {
+  openProject(id: string): ProjectCapability {
+    return new ProjectCapability(id);
+  }
+
+  openProjectRecord(id: string): { project: ProjectCapability } {
+    return { project: new ProjectCapability(id) };
+  }
+
+  openProjectBundle(id: string): {
+    project: ProjectCapability;
+    documents: DocumentDirectoryCapability;
+    activity: ActivityCapability;
+  } {
+    return {
+      project: new ProjectCapability(id),
+      documents: new DocumentDirectoryCapability(id),
+      activity: new ActivityCapability(id),
+    };
   }
 }
 
@@ -987,6 +1031,72 @@ class LayeredChild extends RpcTarget {
         `${name}#${occurrence}:second`, undefined, trackDisposal),
     };
   }
+
+  fallibleBundle(name: string): {
+    first: RpcStub<LayeredGrandchild>;
+    second: RpcStub<LayeredGrandchild>;
+  } {
+    const occurrence = ++this.metrics.fallibleBundleCalls;
+    const trackDisposal = (disposedName: string) => {
+      this.metrics.disposedGrandchildren.push(disposedName);
+    };
+    const result = {
+      first: new RpcStub(new LayeredGrandchild(
+        `${name}#${occurrence}:first`, undefined, trackDisposal)),
+      second: new RpcStub(new LayeredGrandchild(
+        `${name}#${occurrence}:second`, undefined, trackDisposal)),
+    };
+    return result;
+  }
+
+  async delayedBundle(name: string): Promise<{
+    first: RpcStub<LayeredGrandchild>;
+    second: RpcStub<LayeredGrandchild>;
+  }> {
+    const occurrence = ++this.metrics.delayedBundleCalls;
+    const trackDisposal = (disposedName: string) => {
+      this.metrics.disposedGrandchildren.push(disposedName);
+    };
+    const result = {
+      first: new RpcStub(new LayeredGrandchild(
+        `${name}#${occurrence}:first`, undefined, trackDisposal)),
+      second: new RpcStub(new LayeredGrandchild(
+        `${name}#${occurrence}:second`, undefined, trackDisposal)),
+    };
+    if (this.metrics.delayBundleResolution) {
+      await this.metrics.delayedBundleGate.promise;
+    }
+    return result;
+  }
+
+  async topLevelAsyncRecord(): Promise<{ status: string }> {
+    await Promise.resolve();
+    return { status: "ready" };
+  }
+
+  nestedPromiseOnly(): { settled: Promise<string> } {
+    return { settled: Promise.resolve("ready") };
+  }
+
+  nestedPromiseWithRawTargets(): {
+    first: LayeredGrandchild;
+    settled: Promise<string>;
+  } {
+    return {
+      first: new LayeredGrandchild("raw-target"),
+      settled: Promise.resolve("ready"),
+    };
+  }
+
+  nestedPromiseWithStubTargets(): {
+    first: RpcStub<LayeredGrandchild>;
+    settled: Promise<string>;
+  } {
+    return {
+      first: new RpcStub(new LayeredGrandchild("stub-target")),
+      settled: Promise.resolve("ready"),
+    };
+  }
 }
 
 class LayeredSurface extends RpcTarget {
@@ -1012,6 +1122,10 @@ class LayeredSurface extends RpcTarget {
 class LayeredApplication extends LayeredSurface {}
 
 class LayeredRoot extends LayeredSurface {
+  openNestedSideA(): SideACapability {
+    return new SideACapability();
+  }
+
   application(): LayeredApplication {
     return new LayeredApplication(this.metrics);
   }
@@ -1050,9 +1164,12 @@ async function wakeLayered(
     store: CountingSessionStore,
     metrics = new LayeredMetrics(),
     traceEvents?: ObservedTraceEvent[],
-    codecOptions: LayeredCodecOptions | false = DEFAULT_LAYERED_CODEC) {
+    codecOptions: LayeredCodecOptions | false = DEFAULT_LAYERED_CODEC,
+    transformSnapshot?: (snapshot: any) => void) {
   const sessionId: string = session.sessionId;
-  store.snapshots.set(sessionId, structuredClone(session.__experimental_snapshot()));
+  const snapshot = structuredClone(session.__experimental_snapshot());
+  transformSnapshot?.(snapshot);
+  store.snapshots.set(sessionId, snapshot);
 
   const server = new FakeWebSocket();
   client.connect(server);
@@ -1073,6 +1190,19 @@ async function wakeLayered(
 }
 
 describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
+  it("defines the wire boundary for top-level and nested native promises", async () => {
+    const { api } = await connectLayered();
+    const child = await (await api.application()).child();
+
+    expect(await child.topLevelAsyncRecord()).toEqual({ status: "ready" });
+    expect(await rpcRejectionMessage(child.nestedPromiseOnly())).toBe(
+      "Cannot serialize value: [object Promise]");
+    expect(await rpcRejectionMessage(child.nestedPromiseWithRawTargets())).toBe(
+      "Cannot serialize value: [object Promise]");
+    expect(await rpcRejectionMessage(child.nestedPromiseWithStubTargets())).toBe(
+      "Cannot serialize value: [object Promise]");
+  });
+
   it("keeps lazily restored capabilities reusable across every wire codec", async () => {
     const configurations: Array<{
       name: string;
@@ -1147,7 +1277,7 @@ describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
       JSON.stringify(entry.provenance.expr))).size).toBe(1);
   });
 
-  it("checks whether sibling exports share or reuse hook objects", async () => {
+  it("binds sibling exports independently from one reconstructed result", async () => {
     const { api, client, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
@@ -1172,15 +1302,15 @@ describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
     const afterFirstUse = matching(restored.__experimental_debugState());
     expect(afterFirstUse.map((entry: any) => entry.hasHook)).toEqual([
       true,
-      false,
+      true,
     ]);
-    // Current restoration binds only the requested export. It neither reuses
-    // the original hook nor silently binds the sibling export.
+    expect(new Set(afterFirstUse.map((entry: any) =>
+      entry.hookIdentity?.hookObjectId)).size).toBe(2);
     expect(afterFirstUse[0].hookIdentity?.hookObjectId).not.toBe(
       beforeWake[0].hookIdentity?.hookObjectId);
   });
 
-  it("checks the actual replay order when first then second sibling are used", async () => {
+  it("restores first then second sibling from one replay", async () => {
     const { api, client, metrics, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
@@ -1190,14 +1320,12 @@ describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
     expect(await bundle.first.identify()).toBe("forward-order#2:first");
     expect(await bundle.first.identify()).toBe("forward-order#2:first");
     expect(metrics.trackedBundleCalls).toBe(2);
-    expect(await rpcRejectionMessage(bundle.second.identify())).toBe(
-      "Attempted to use an RPC StubHook after it was disposed.");
-    // The second retained export independently re-runs trackedBundle() before
-    // failing while traversing the already-disposed reconstructed parent.
-    expect(metrics.trackedBundleCalls).toBe(3);
+    expect(await bundle.second.identify()).toBe("forward-order#2:second");
+    expect(await bundle.second.identify()).toBe("forward-order#2:second");
+    expect(metrics.trackedBundleCalls).toBe(2);
   });
 
-  it("checks that whichever sibling is used second hits the failure", async () => {
+  it("restores second then first sibling from one replay", async () => {
     const { api, client, metrics, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
@@ -1206,12 +1334,12 @@ describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
 
     expect(await bundle.second.identify()).toBe("reverse-order#2:second");
     expect(await bundle.second.identify()).toBe("reverse-order#2:second");
-    expect(await rpcRejectionMessage(bundle.first.identify())).toBe(
-      "Attempted to use an RPC StubHook after it was disposed.");
-    expect(metrics.trackedBundleCalls).toBe(3);
+    expect(await bundle.first.identify()).toBe("reverse-order#2:first");
+    expect(await bundle.first.identify()).toBe("reverse-order#2:first");
+    expect(metrics.trackedBundleCalls).toBe(2);
   });
 
-  it("measures disposal after the successful first replay without changing source", async () => {
+  it("disposes each restored sibling only when its own stub is released", async () => {
     const { api, client, metrics, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
@@ -1224,39 +1352,85 @@ describe("current lazy-restoration mechanics (diagnostic baseline)", () => {
     const replayDisposals = () => metrics.disposedGrandchildren.filter(
       name => name.startsWith("baseline-disposal#2:"));
 
-    // The replay's unselected second target is released with the temporary
-    // result; the selected first target remains alive behind its export.
-    expect(replayDisposals()).toEqual(["baseline-disposal#2:second"]);
+    // Both exports are retained by the client and therefore remain live after
+    // the temporary replay result has been cleaned up.
+    expect(replayDisposals()).toEqual([]);
 
     bundle.first[Symbol.dispose]();
     await flush();
+    expect(replayDisposals()).toEqual(["baseline-disposal#2:first"]);
+    expect(await bundle.second.identify()).toBe(
+      "baseline-disposal#2:second");
+
+    bundle.second[Symbol.dispose]();
+    await flush();
     expect(replayDisposals()).toEqual([
-      "baseline-disposal#2:second",
       "baseline-disposal#2:first",
+      "baseline-disposal#2:second",
     ]);
   });
 
-  it("measures cleanup of targets created by the failing second replay", async () => {
+  it("cleans up every target when lazy result materialization rejects", async () => {
     const { api, client, metrics, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
-    const bundle = await child.trackedBundle("failed-replay-disposal");
-    await wakeLayered(client, session, store, metrics);
+    const bundle = await child.fallibleBundle("failed-replay-disposal");
+    expect(await bundle.first.identify()).toBe(
+      "failed-replay-disposal#1:first");
+    await wakeLayered(
+      client,
+      session,
+      store,
+      metrics,
+      undefined,
+      DEFAULT_LAYERED_CODEC,
+      snapshot => {
+        for (const exported of snapshot.exports) {
+          if (JSON.stringify(exported.provenance?.expr)
+              .includes("failed-replay-disposal")) {
+            exported.provenance.instructions = [["invalid-map-op"]];
+          }
+        }
+      },
+    );
 
-    expect(await bundle.first.identify()).toBe(
-      "failed-replay-disposal#2:first");
-    expect(await bundle.first.identify()).toBe(
-      "failed-replay-disposal#2:first");
-    expect(await rpcRejectionMessage(bundle.second.identify())).toBe(
-      "Attempted to use an RPC StubHook after it was disposed.");
+    expect(await rpcRejectionMessage(bundle.first.identify())).toBeDefined();
     await flush();
 
-    // Even though the second restoration attempt fails, both targets created
-    // by that third trackedBundle() call are released rather than leaked.
+    // The failed replay created two targets. Neither was installed in an
+    // export, so both must be released with the failed temporary result.
     expect(metrics.disposedGrandchildren.filter(
-      name => name.startsWith("failed-replay-disposal#3:"))).toEqual([
-      "failed-replay-disposal#3:first",
-      "failed-replay-disposal#3:second",
+      name => name.startsWith("failed-replay-disposal#2:"))).toEqual([
+      "failed-replay-disposal#2:first",
+      "failed-replay-disposal#2:second",
+    ]);
+  });
+
+  it("cleans up a pending lazy replay when every retained stub is released", async () => {
+    const { api, client, metrics, session, store } = await connectLayered();
+    const application = await api.application();
+    const child = await application.child();
+    const bundle = await child.delayedBundle("pending-release");
+    expect(metrics.delayedBundleCalls).toBe(1);
+
+    metrics.delayBundleResolution = true;
+    await wakeLayered(client, session, store, metrics);
+
+    const pendingUse = bundle.first.identify();
+    await flush();
+    expect(metrics.delayedBundleCalls).toBe(2);
+
+    bundle.first[Symbol.dispose]();
+    bundle.second[Symbol.dispose]();
+    await flush();
+    metrics.delayedBundleGate.resolve();
+    await rpcRejectionMessage(pendingUse);
+    await flush();
+
+    expect(metrics.disposedGrandchildren.filter(
+      name => name.startsWith("pending-release#2:"))).toEqual([
+      "pending-release#2:first",
+      "pending-release#2:second",
     ]);
   });
 
@@ -1476,6 +1650,36 @@ describe("lazy restoration of grandchildren returned by a child capability", () 
   });
 });
 
+describe("callback-free SideA grandchildren survive lazy restoration", () => {
+  it("reuses an earlier record-wrapped grandchild after reconstructing its parent", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const sideA = await api.openNestedSideA();
+    const record = await sideA.openProjectRecord("original");
+
+    await wakeLayered(client, session, store);
+
+    const warmup = await sideA.openProject("parent-reconstruction");
+    expect(await warmup.read()).toBe("project:parent-reconstruction");
+    expect(await record.project.read()).toBe("project:original");
+    expect(await record.project.read()).toBe("project:original");
+  });
+
+  it("independently and repeatedly uses every callback-free bundled grandchild", async () => {
+    const { api, client, session, store } = await connectLayered();
+    const sideA = await api.openNestedSideA();
+    const bundle = await sideA.openProjectBundle("bundled");
+
+    await wakeLayered(client, session, store);
+
+    expect(await bundle.project.read()).toBe("project:bundled");
+    expect(await bundle.project.read()).toBe("project:bundled");
+    expect(await bundle.documents.list()).toEqual(["document:bundled"]);
+    expect(await bundle.documents.list()).toEqual(["document:bundled"]);
+    expect(await bundle.activity.latest()).toBe("activity:bundled");
+    expect(await bundle.activity.latest()).toBe("activity:bundled");
+  });
+});
+
 describe("lazy restoration through a returned application root and child", () => {
   it("restores a capability returned directly by the application child", async () => {
     const { api, client, session, store } = await connectLayered();
@@ -1638,7 +1842,7 @@ describe("lazy restoration retains only live export families", () => {
     expect(metrics.trackedBundleCalls).toBe(2);
   });
 
-  it("keeps identical-looking call occurrences as distinct restoration families", async () => {
+  it("restores two distinct calls made through the same reconstructed child", async () => {
     const { api, client, metrics, session, store } = await connectLayered();
     const application = await api.application();
     const child = await application.child();
@@ -1654,6 +1858,27 @@ describe("lazy restoration retains only live export families", () => {
     expect(await secondCall.first.identify()).toBe("same-input#4:first");
     expect(await secondCall.first.identify()).toBe("same-input#4:first");
     expect(metrics.trackedBundleCalls).toBe(4);
+
+    firstCall.first[Symbol.dispose]();
+    firstCall.second[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposedGrandchildren.filter(
+      name => name.startsWith("same-input#3:"))).toEqual([
+      "same-input#3:first",
+      "same-input#3:second",
+    ]);
+    expect(metrics.disposedGrandchildren.filter(
+      name => name.startsWith("same-input#4:"))).toEqual([]);
+    expect(await secondCall.second.identify()).toBe("same-input#4:second");
+
+    secondCall.first[Symbol.dispose]();
+    secondCall.second[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposedGrandchildren.filter(
+      name => name.startsWith("same-input#4:"))).toEqual([
+      "same-input#4:first",
+      "same-input#4:second",
+    ]);
   });
 
   it("re-evaluates one retained family once rather than once per sibling", async () => {
@@ -1690,6 +1915,11 @@ describe("lazy restoration retains only live export families", () => {
     expect(await bundle.first.identify()).toBe("repeated-wake#3:first");
     expect(secondRestore.__experimental_snapshot().exports.length).toBe(selectedExportCount);
     expect(metrics.trackedBundleCalls).toBe(3);
+
+    bundle.first[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposedGrandchildren.filter(
+      name => name === "repeated-wake#3:first")).toHaveLength(1);
   });
 });
 
@@ -1840,6 +2070,19 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     }
   }
 
+  class ReadTier extends RpcTarget {
+    read(): string { return "read"; }
+  }
+
+  class EditorTier extends RpcTarget {
+    write(): string { return "write"; }
+    asRead(): ReadTier { return new ReadTier(); }
+  }
+
+  class DocumentAuthority extends RpcTarget {
+    claimEditor(_documentId: string): EditorTier { return new EditorTier(); }
+  }
+
   // Connect, run `exercise` (which retains stubs in `held`), snapshot, then WAKE
   // from the snapshot in a fresh server session. Returns the wake outcome.
   async function runWake(
@@ -1853,7 +2096,11 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     const session = await __experimental_newHibernatableWebSocketRpcSession(
       server as unknown as WebSocket,
       makeMain(),
-      { sessionStore: store, snapshotSecurity: security, snapshotSecurityAssociatedData: assoc },
+      {
+        sessionStore: store,
+        snapshotSecurity: security,
+        snapshotSecurityAssociatedData: assoc,
+      },
     );
     if (!session) throw new Error("failed to create session");
     server.addEventListener("message", (e) => session.handleMessage(e.data));
@@ -1861,6 +2108,7 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
     const held: unknown[] = [];
     const verifyRetainedCapabilities = await exercise(api, held);
     await new Promise((r) => setTimeout(r, 0));
+    await session.__experimental_flushPersistence();
     expect(store.snapshots.has(session.sessionId)).toBe(true);
     const server2 = new FakeWebSocket();
     client.connect(server2);
@@ -1955,5 +2203,220 @@ describe("held nested applet capabilities + avatar stream survive a wake", () =>
       };
     });
     console.log("[D await-persona]", r.ok ? "OK" : `CLOSED "${r.reason}"`);
+  });
+
+  it("starts a new child call from the original un-awaited result after wake", async () => {
+    const r = await runWake(() => new MainTarget(), async (api, held) => {
+      const persona = api.persona();
+      held.push(persona);
+      return async () => {
+        const subscription = await persona.avatar(new WriterTarget());
+        expect(await subscription.ping()).toBe("subscription");
+        subscription[Symbol.dispose]();
+      };
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  // Known limitation: the child's lazy provenance still references its transient
+  // positive parent export after that parent has been materialized and released.
+  it.fails("restores a callback-free child derived through promise pipelining", async () => {
+    const r = await runWake(() => new DocumentAuthority(), async (api, held) => {
+      const editor = api.claimEditor("doc");
+      const reader = await editor.asRead();
+      held.push(editor, reader);
+      return async () => {
+        expect(await reader.read()).toBe("read");
+      };
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it.fails("reuses the original pipelined parent and its callback-free derived child", async () => {
+    const r = await runWake(() => new DocumentAuthority(), async (api, held) => {
+      const editor = api.claimEditor("doc");
+      const reader = await editor.asRead();
+      held.push(editor, reader);
+      return async () => {
+        expect(await editor.write()).toBe("write");
+        expect(await reader.read()).toBe("read");
+      };
+    });
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("pre-snapshot materialization of peer-held positive results", () => {
+  class MaterializationMetrics {
+    calls = 0;
+    disposed: string[] = [];
+  }
+
+  class MaterializedCapability extends RpcTarget {
+    constructor(
+      private readonly name: string,
+      private readonly metrics: MaterializationMetrics,
+    ) {
+      super();
+    }
+
+    identify(): string {
+      return this.name;
+    }
+
+    [Symbol.dispose](): void {
+      this.metrics.disposed.push(this.name);
+    }
+  }
+
+  class MaterializationRoot extends RpcTarget {
+    constructor(private readonly metrics: MaterializationMetrics) {
+      super();
+    }
+
+    open(name: string): MaterializedCapability {
+      const occurrence = ++this.metrics.calls;
+      return new MaterializedCapability(`${name}#${occurrence}`, this.metrics);
+    }
+
+    fail(message: string): never {
+      ++this.metrics.calls;
+      throw new Error(message);
+    }
+  }
+
+  async function connectMaterialization(metrics: MaterializationMetrics) {
+    const store = new CountingSessionStore();
+    const { client, server } = createFakeWebSocketPair();
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+      server as unknown as WebSocket,
+      new MaterializationRoot(metrics),
+      { sessionStore: store },
+    );
+    if (!session) throw new Error("failed to create materialization session");
+    server.addEventListener("message", event => session.handleMessage(event.data));
+    const api = newWebSocketRpcSession<MaterializationRoot>(
+      client as unknown as WebSocket);
+    return { api, client, session, store };
+  }
+
+  async function wakeMaterialization(
+    client: FakeWebSocket,
+    session: HibernatableWebSocketSession,
+    store: CountingSessionStore,
+    metrics: MaterializationMetrics,
+  ) {
+    await flush();
+    await session.__experimental_flushPersistence();
+    const server = new FakeWebSocket();
+    client.connect(server);
+    server.connect(client);
+    const restored = await __experimental_newHibernatableWebSocketRpcSession(
+      server as unknown as WebSocket,
+      new MaterializationRoot(metrics),
+      { sessionStore: store, sessionId: session.sessionId },
+    );
+    if (!restored) throw new Error("failed to restore materialization session");
+    server.addEventListener("message", event => restored.handleMessage(event.data));
+    return restored;
+  }
+
+  it("converts untouched call results into selective lazy exports", async () => {
+    const metrics = new MaterializationMetrics();
+    const { api, client, session, store } = await connectMaterialization(metrics);
+    const first = api.open("first");
+    const second = api.open("second");
+
+    await flush();
+    await session.__experimental_flushPersistence();
+    const snapshot = session.__experimental_snapshot();
+    expect(snapshot.positiveBases ?? []).toEqual([]);
+    expect(snapshot.exports).toHaveLength(2);
+    expect(snapshot.exports.every(entry => entry.id < 0 && !!entry.provenance)).toBe(true);
+
+    await wakeMaterialization(client, session, store, metrics);
+    expect(await first.identify()).toBe("first#3");
+    expect(await first.identify()).toBe("first#3");
+    expect(await second.identify()).toBe("second#4");
+    expect(await second.identify()).toBe("second#4");
+  });
+
+  it("keeps independently materialized results distinct and disposes each once", async () => {
+    const metrics = new MaterializationMetrics();
+    const { api, client, session, store } = await connectMaterialization(metrics);
+    const first = api.open("first");
+    const second = api.open("second");
+
+    await wakeMaterialization(client, session, store, metrics);
+    expect(await first.identify()).toBe("first#3");
+    expect(await second.identify()).toBe("second#4");
+
+    first[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposed.filter(name => name === "first#3")).toHaveLength(1);
+    expect(metrics.disposed.filter(name => name === "second#4")).toHaveLength(0);
+    expect(await second.identify()).toBe("second#4");
+
+    second[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposed.filter(name => name === "second#4")).toHaveLength(1);
+  });
+
+  it("does not materialize or replay a positive result released before persistence", async () => {
+    const metrics = new MaterializationMetrics();
+    const { api, client, session, store } = await connectMaterialization(metrics);
+    const released = api.open("released");
+    const retained = api.open("retained");
+    released[Symbol.dispose]();
+    await flush();
+
+    await session.__experimental_flushPersistence();
+    const snapshot = session.__experimental_snapshot();
+    expect(snapshot.positiveBases ?? []).toEqual([]);
+    expect(snapshot.exports).toHaveLength(1);
+    expect(metrics.disposed.filter(name => name === "released#1")).toHaveLength(1);
+
+    await wakeMaterialization(client, session, store, metrics);
+    expect(await retained.identify()).toBe("retained#3");
+    expect(await retained.identify()).toBe("retained#3");
+    expect(metrics.calls).toBe(3);
+
+    retained[Symbol.dispose]();
+    await flush();
+    expect(metrics.disposed.filter(name => name === "retained#3")).toHaveLength(1);
+  });
+
+  it("removes a materialized result released before hibernation and never replays it", async () => {
+    const metrics = new MaterializationMetrics();
+    const { api, client, session, store } = await connectMaterialization(metrics);
+    const capability = api.open("released-after-materialization");
+
+    await flush();
+    await session.__experimental_flushPersistence();
+    expect(session.__experimental_snapshot().exports).toHaveLength(1);
+
+    capability[Symbol.dispose]();
+    await flush();
+    await session.__experimental_flushPersistence();
+    expect(session.__experimental_snapshot().exports).toEqual([]);
+    expect(metrics.disposed).toEqual(["released-after-materialization#1"]);
+
+    await wakeMaterialization(client, session, store, metrics);
+    expect(metrics.calls).toBe(1);
+    expect(metrics.disposed).toEqual(["released-after-materialization#1"]);
+  });
+
+  it("persists no export or positive base when materialization rejects", async () => {
+    const metrics = new MaterializationMetrics();
+    const { api, session } = await connectMaterialization(metrics);
+    const failure = api.fail("materialization rejected");
+
+    await flush();
+    await session.__experimental_flushPersistence();
+    expect(await rpcRejectionMessage(failure)).toBe("materialization rejected");
+    expect(session.__experimental_snapshot().exports).toEqual([]);
+    expect(session.__experimental_snapshot().positiveBases ?? []).toEqual([]);
+    expect(metrics.calls).toBe(1);
+    expect(metrics.disposed).toEqual([]);
   });
 });

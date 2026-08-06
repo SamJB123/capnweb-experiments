@@ -6,6 +6,10 @@ import type { PropertyPath } from "./core.js";
 
 export type RpcSessionExportProvenance = {
   expr: unknown;
+  /** Existing positive export id of the particular call result that produced
+   *  this export. Lazy restoration uses it to bind all still-live siblings
+   *  from one evaluation, just as importReplay does for eager restoration. */
+  producerExportId?: number;
   captures?: ["import", number][];
   instructions?: unknown[];
   path?: PropertyPath;

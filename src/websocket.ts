@@ -105,6 +105,7 @@ export interface HibernatableWebSocketSession {
   getStats(): {imports: number, exports: number};
   __experimental_snapshot(): RpcSessionSnapshot;
   __experimental_debugState(): RpcSessionDebugState;
+  __experimental_flushPersistence(): Promise<void>;
   handleMessage(message: string | ArrayBuffer): void;
   handleClose(code?: number, reason?: string, wasClean?: boolean): void;
   handleError(error: any): void;
@@ -165,16 +166,30 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
   }
 
   let rpc!: RpcSession;
-  let persistScheduled = false;
-  let transport = new HibernatableWebSocketTransport(webSocket, () => {
-    if (!persistScheduled) {
-      persistScheduled = true;
-      queueMicrotask(() => {
-        persistScheduled = false;
-        void persistSnapshot();
-      });
-    }
-  }, trace);
+  let persistRunning = false;
+  let persistRequested = false;
+  const persistIdleWaiters: Array<() => void> = [];
+  const requestPersist = () => {
+    persistRequested = true;
+    if (persistRunning) return;
+    persistRunning = true;
+    queueMicrotask(async () => {
+      try {
+        while (persistRequested) {
+          persistRequested = false;
+          await persistSnapshot();
+        }
+      } finally {
+        persistRunning = false;
+        if (persistRequested) {
+          requestPersist();
+        } else {
+          for (const resolve of persistIdleWaiters.splice(0)) resolve();
+        }
+      }
+    });
+  };
+  let transport = new HibernatableWebSocketTransport(webSocket, requestPersist, trace);
 
   // With a codec, the session talks to a CodecTransport that encodes/decodes and passes raw
   // frames through the hibernatable transport underneath. The hibernatable machinery (below)
@@ -229,6 +244,10 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     __experimental_debugState() {
       return rpc.__experimental_debugState();
     },
+    async __experimental_flushPersistence() {
+      if (!persistRunning && !persistRequested) return;
+      await new Promise<void>(resolve => persistIdleWaiters.push(resolve));
+    },
     handleMessage(message: string | ArrayBuffer) {
       transport.pushIncoming(message);
     },
@@ -247,6 +266,7 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
 
   async function persistSnapshot() {
     try {
+      await rpc.__experimental_materializeLivePositiveExports();
       let snap = rpc.__experimental_snapshot();
       let snapshotJson = JSON.stringify(snap);
       let existing = getAttachmentRecord(webSocket);
@@ -606,6 +626,7 @@ class HibernatableWebSocketTransport {
   #receiveRejecter?: (err: any) => void;
   #receiveQueue: (string | Uint8Array)[] = [];
   #error?: any;
+  #deliveredSinceLastReceive = false;
 
   async send(message: string | Uint8Array): Promise<void> {
     if (this.#error) throw this.#error;
@@ -652,7 +673,15 @@ class HibernatableWebSocketTransport {
   }
 
   async receive(): Promise<string | Uint8Array> {
+    // The RPC loop requests its next frame only after it has finished applying
+    // the previous one. Persist here so snapshots observe committed RPC state,
+    // rather than at pushIncoming() time while the frame is merely queued.
+    if (this.#deliveredSinceLastReceive) {
+      this.#deliveredSinceLastReceive = false;
+      this.onActivity?.();
+    }
     if (this.#receiveQueue.length > 0) {
+      this.#deliveredSinceLastReceive = true;
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
@@ -708,13 +737,13 @@ class HibernatableWebSocketTransport {
         message instanceof ArrayBuffer ? new Uint8Array(message) : message;
 
     if (this.#receiveResolver) {
+      this.#deliveredSinceLastReceive = true;
       this.#receiveResolver(normalized);
       this.#receiveResolver = undefined;
       this.#receiveRejecter = undefined;
     } else {
       this.#receiveQueue.push(normalized);
     }
-    this.onActivity?.();
   }
 
   notifyClosed(code?: number, reason?: string, wasClean?: boolean): void {

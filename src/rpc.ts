@@ -7,6 +7,7 @@ import {
   RpcPayload,
   RpcStub,
   RpcPromise,
+  PromiseStubHook,
   PropertyPath,
   PayloadStubHook,
   ErrorStubHook,
@@ -620,6 +621,10 @@ class RpcSessionImpl implements Importer, Exporter {
   // How many promises is our peer expecting us to resolve?
   private pullCount = 0;
   private currentNegativeExportProvenanceExpr?: unknown;
+  // Existing positive export id of the call result currently being devaluated.
+  // Persisted on returned negative exports so lazy restoration can rebind all
+  // still-live siblings from that exact invocation in one evaluation.
+  private currentNegativeExportProducerId?: ExportId;
   // While resolving a replay-recorded call's result, the replay record being
   // populated. Every negative export created during that resolve (each returned
   // capability, however deeply nested) records its id here, so restore knows the
@@ -747,6 +752,9 @@ class RpcSessionImpl implements Importer, Exporter {
             let mapProgram = __experimental_recordInputPath(path ?? []);
             return {
               expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
+              ...(this.currentNegativeExportProducerId !== undefined ? {
+                producerExportId: this.currentNegativeExportProducerId,
+              } : {}),
               captures: mapProgram.captures,
               instructions: mapProgram.instructions,
             };
@@ -776,6 +784,9 @@ class RpcSessionImpl implements Importer, Exporter {
           let mapProgram = __experimental_recordInputPath(path ?? []);
           return {
             expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
+            ...(this.currentNegativeExportProducerId !== undefined ? {
+              producerExportId: this.currentNegativeExportProducerId,
+            } : {}),
             captures: mapProgram.captures,
             instructions: mapProgram.instructions,
           };
@@ -885,8 +896,10 @@ class RpcSessionImpl implements Importer, Exporter {
       exp.pull = resolve().then(
         payload => {
           const previousExpr = this.currentNegativeExportProvenanceExpr;
+          const previousProducerId = this.currentNegativeExportProducerId;
           const previousReplay = this.currentResolveReplay;
           this.currentNegativeExportProvenanceExpr = exp.provenance?.expr ?? exp.sourceExpr;
+          this.currentNegativeExportProducerId = exportId;
           // If this call was replay-recorded, every negative export created while
           // devaluing its result (each returned capability, however deeply nested)
           // registers its id on the replay record via exportStub/exportPromise —
@@ -901,6 +914,7 @@ class RpcSessionImpl implements Importer, Exporter {
             value = Devaluator.devaluate(payload.value, undefined, this, payload, this.encodingLevel);
           } finally {
             this.currentNegativeExportProvenanceExpr = previousExpr;
+            this.currentNegativeExportProducerId = previousProducerId;
             this.currentResolveReplay = previousReplay;
           }
           this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
@@ -979,6 +993,17 @@ class RpcSessionImpl implements Importer, Exporter {
     let entry = this.exports[idx];
     if (!entry) return undefined;
     return this.getOrRestoreExportHook(idx);
+  }
+
+  async __experimental_materializeLivePositiveExports(): Promise<void> {
+    for (let i in this.exports) {
+      const id = Number(i);
+      const entry = this.exports[i];
+      if (id > 0 && entry?.refcount > 0 && !entry.pull) {
+        this.ensureResolvingExport(id);
+      }
+    }
+    await this.drain();
   }
 
   __experimental_snapshot(): RpcSessionSnapshot {
@@ -1618,6 +1643,32 @@ class RpcSessionImpl implements Importer, Exporter {
     }
   }
 
+  /**
+   * Evaluate a lazy-restoration expression and collapse any nested promise-hook
+   * chain into one independently owned payload before callers derive exports
+   * from it. This is deliberately separate from deriveExportHookFromBase(),
+   * which is also used by eager import replay.
+   */
+  private evaluateLazyRestorationBase(expr: unknown): StubHook {
+    const evaluated = new PayloadStubHook(
+      new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(expr)));
+
+    const materialized = Promise.resolve(evaluated.pull()).then(async payload => {
+      try {
+        const value = await payload.deliverResolve();
+        return new PayloadStubHook(
+          RpcPayload.deepCopyFrom(value, undefined, payload));
+      } finally {
+        evaluated.dispose();
+      }
+    }, error => {
+      evaluated.dispose();
+      throw error;
+    });
+
+    return new PromiseStubHook(materialized);
+  }
+
   private getOrRestoreExportHook(exportId: ExportId): StubHook {
     const entry = this.exports[exportId];
     if (!entry) {
@@ -1626,19 +1677,38 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (!entry.hook) {
       if (entry.provenance) {
-        const base = new PayloadStubHook(new Evaluator(this, this.encodingLevel).evaluate(cloneRpcExpr(entry.provenance.expr)));
+        const base = this.evaluateLazyRestorationBase(entry.provenance.expr);
         try {
-          entry.hook = this.deriveExportHookFromBase(entry.provenance, base);
+          const producerExportId = entry.provenance.producerExportId;
+          const exportsToBind = producerExportId === undefined
+            ? [[exportId, entry] as const]
+            : Object.keys(this.exports)
+                .map(Number)
+                .map(id => [id, this.exports[id]] as const)
+                .filter((candidate): candidate is readonly [number, ExportTableEntry] =>
+                  !!candidate[1] &&
+                  !candidate[1].hook &&
+                  candidate[1].provenance?.producerExportId === producerExportId);
+
+          for (const [siblingExportId, siblingEntry] of exportsToBind) {
+            const provenance = siblingEntry.provenance;
+            if (!provenance) continue;
+            siblingEntry.hook = this.deriveExportHookFromBase(provenance, base);
+            this.reverseExports.set(siblingEntry.hook, siblingExportId);
+            this.trace("getOrRestoreExportHook.replay", {
+              exportId: siblingExportId,
+              producerExportId,
+              pathLength: provenance.path?.length ?? 0,
+              instructionCount: provenance.instructions?.length ?? 0,
+              hookType: siblingEntry.hook.constructor?.name ?? null,
+            });
+          }
         } finally {
           base.dispose();
         }
-        this.reverseExports.set(entry.hook, exportId);
-        this.trace("getOrRestoreExportHook.replay", {
-          exportId,
-          pathLength: entry.provenance.path?.length ?? 0,
-          instructionCount: entry.provenance.instructions?.length ?? 0,
-          hookType: entry.hook.constructor?.name ?? null,
-        });
+        if (!entry.hook) {
+          throw new Error(`Export ${exportId} was not rebound from its producer call result.`);
+        }
       } else {
         throw new Error(`Export ${exportId} can't be restored after hibernation because it has no provenance.`);
       }
@@ -1870,6 +1940,10 @@ export class RpcSession {
 
   drain(): Promise<void> {
     return this.#session.drain();
+  }
+
+  __experimental_materializeLivePositiveExports(): Promise<void> {
+    return this.#session.__experimental_materializeLivePositiveExports();
   }
 
   __experimental_snapshot(): RpcSessionSnapshot {

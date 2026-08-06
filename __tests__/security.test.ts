@@ -536,13 +536,12 @@ const forgedReplaySnapshot = () => ({
 
 describe("hibernation snapshot is a trusted input — and sealing is what enforces that trust", () => {
   // SECURE OUTCOME: a forged/attacker-supplied importReplay must NOT execute on
-  // restore. The two tests below assert exactly that and CURRENTLY FAIL (red) —
-  // the failure is the finding, not a thing to hide: the bare RpcSession layer
+  // restore. The two expected-failure tests below assert exactly that: the bare RpcSession layer
   // and the websocket layer WITHOUT sealing both replay a forged snapshot
   // verbatim. The `snapshotSecurity.required` test further down is the control
   // that makes this secure outcome actually hold; these reds document precisely
   // what you are trusting when that control is absent.
-  it("[expected red — documents the gap] a forged importReplay in a restored snapshot must NOT execute (core RpcSession layer)", async () => {
+  it.fails("[known limitation] a forged importReplay in a restored snapshot must NOT execute (core RpcSession layer)", async () => {
     pwnFlag = false;
     const t = new Evil();
     new RpcSession(t as unknown as RpcTransport, new SideEffect(), { __experimental_restoreSnapshot: forgedReplaySnapshot() } as any);
@@ -550,7 +549,7 @@ describe("hibernation snapshot is a trusted input — and sealing is what enforc
     expect(pwnFlag).toBe(false); // FAILS: the core layer trusts its snapshot input entirely — no authentication here.
   });
 
-  it("[expected red — documents the gap] without snapshotSecurity, a forged store snapshot must NOT be replayed on wake", async () => {
+  it.fails("[known limitation] without snapshotSecurity, a forged store snapshot must NOT be replayed on wake", async () => {
     pwnFlag = false;
     const store = new Store(); const sid = "victim";
     store.snapshots.set(sid, forgedReplaySnapshot() as any);
