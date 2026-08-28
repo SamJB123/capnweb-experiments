@@ -412,6 +412,16 @@ class RpcImportHook extends StubHook {
     }
   }
 
+  oneway(path: PropertyPath, args: RpcPayload): void {
+    let entry = this.getEntryTakingOwnership(() => args.dispose());
+    if (entry.resolution) {
+      // Already resolved (locally or to another hook): no wire message of our own to send.
+      entry.resolution.oneway(path, args);
+    } else {
+      entry.session.sendOneway(entry.importId, path, args);
+    }
+  }
+
   map(path: PropertyPath, captures: StubHook[], instructions: unknown[]): StubHook {
     let entry = this.getEntryTakingOwnership(() => {
       for (let cap of captures) {
@@ -1220,6 +1230,31 @@ class RpcSessionImpl implements Importer, Exporter {
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
 
+  // Emit one ["oneway", Expression] frame. No import entry is allocated and no reply will ever
+  // arrive, so nothing is retained on either session (see StubHook.oneway).
+  sendOneway(id: ImportId, path: PropertyPath, args: RpcPayload): void {
+    if (this.abortReason) {
+      args.dispose();
+      throw this.abortReason;
+    }
+
+    let value: Array<any> = ["pipeline", id, path];
+    let devalue: unknown;
+    try {
+      devalue = Devaluator.devaluate(args.value, undefined, this, args, this.encodingLevel);
+    } catch (err) {
+      // Same reasoning as sendCall(): the Devaluator rolls back its own export-table entries.
+      args.dispose();
+      throw err;
+    }
+
+    // HACK: Since the args is an array, devaluator will wrap in a second array. Need to unwrap.
+    value.push((<Array<unknown>>devalue)[0]);
+
+    this.send(["oneway", value]);
+    this.trace("sendOneway", { targetImportId: id, pathLength: path.length });
+  }
+
   sendStream(id: ImportId, path: PropertyPath, args: RpcPayload)
       : {promise: Promise<void>, size: number} {
     if (this.abortReason) {
@@ -1427,6 +1462,19 @@ class RpcSessionImpl implements Importer, Exporter {
 
       if (msg instanceof Array) {
         switch (msg[0]) {
+          case "oneway":  // ["oneway", Expression]
+            // Evaluating the expression performs the call. The sender allocated no import for
+            // the result, so there is nothing to resolve: drop the payload right away. Any
+            // capability the arguments carried is released by the disposal like any other.
+            if (msg.length > 1) {
+              let hook = new PayloadStubHook(this.evaluateWithCurrentProvenance(msg[1]));
+              hook.ignoreUnhandledRejections();
+              hook.dispose();
+              this.trace("readLoop.oneway", {});
+              continue;
+            }
+            break;
+
           case "push":  // ["push", ImportId, Expression]
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];

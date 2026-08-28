@@ -1,5 +1,18 @@
 # capnweb
 
+## 0.12.0-hibernation-cbor.1
+
+### CBOR experiment line
+
+- **Fire-and-forget calls.** Three new helpers for hot, result-less calls (presence heartbeats, position updates), each taking `(stub, path, args)`. Background: an ordinary un-awaited stub call is a `push` whose result nobody ever pulls, so its import/export pair is never resolved or released — measured at roughly 7.6 KB retained per call on *both* sessions.
+  - `__experimental_streamCall` routes the call through the existing self-cleaning `["stream"]` message: auto-pulled, auto-released on both sides. Returns a promise that settles once the receiver has processed the call (usable for backpressure, safe to ignore). Costs the caller one inbound `resolve` per call.
+  - `__experimental_releaseCall` is a `push` followed by an immediate `release` of the result: nothing comes back from the receiver, both sides still clean up fully.
+  - `__experimental_onewayCall` uses a **new `["oneway", expression]` wire message**: one outbound frame, no reply, no table entries on either side. Data calls only; both peers must run this version or later (an older peer aborts the session on the unknown tag). Through a resolved or local hook it degrades to call + dispose, and a relay hop forwards it as push + release on its onward leg.
+  - Internals: `StubHook.oneway()` (default call + dispose; `RpcImportHook` sends the frame via the new `RpcSession.sendOneway`), and a `"oneway"` case in the read loop that evaluates the expression and disposes the payload immediately. Documented in `packages/docs/.../reference/protocol.md`.
+- **Fix: `CodecTransport.receive()` no longer retains a promise reaction per message.** Every receive raced the inner read against ONE session-lifetime send-failure promise, so each read left a `PromiseReaction` (and its frame buffer) attached to that promise for the life of the session — a leak proportional to message count on long-lived codec sessions. Each receive now races against its own abort handle; a send failure rejects the receive in flight and every receive after it, which is the same observable contract as before (the same trap `RpcSessionImpl.readLoop` already documents for its cancel promise).
+
+These changes were carried as a `pnpm patch` in the aicolab-portal monorepo since the 0.10.0 line and are now upstream in the fork.
+
 ## 0.12.0-hibernation-cbor.0
 
 ### CBOR experiment line

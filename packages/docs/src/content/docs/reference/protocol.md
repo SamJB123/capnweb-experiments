@@ -221,6 +221,27 @@ Like push, asks the recipient to evaluate the given expression using the caller-
 This message type is designed for streaming writes, where the result is expected to be empty and the
 overhead of separate pull and release messages is high.
 
+### oneway
+
+```json
+["oneway", expression]
+```
+
+Asks the recipient to evaluate the given expression — which performs the call it describes — and
+discard the result. No import ID is chosen, and no pull, resolve, reject or release will ever
+follow: the sender records nothing, and the recipient records nothing. Any capabilities the
+expression's arguments carried are disposed by the recipient along with the result, so they are
+released as usual.
+
+This is the fire-and-forget primitive: exactly one frame on the wire and zero table entries on
+either side. Because nothing is ever reported back, it is only appropriate for calls whose result
+is irrelevant and whose failure the caller does not need to learn about — presence heartbeats,
+position updates, and the like. A `["stream"]` call remains the choice when the caller wants to
+know the receiver has processed it.
+
+Both peers must understand this message; a peer that does not will treat it as malformed and abort
+the session. (This message is specific to the `capnweb-experimental-hibernation` fork.)
+
 ### pipe
 
 ```json

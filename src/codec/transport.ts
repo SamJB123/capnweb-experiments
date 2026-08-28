@@ -45,9 +45,15 @@ export class CodecTransport implements RpcTransportWithCustomEncoding {
   #codec: Codec;
   #maxMessageSize: number;
   // First async send failure. The custom-encoding contract reports send errors via `receive()`
-  // rejecting, so a rejected inner send must interrupt the (possibly already pending) receive.
-  #sendFailure = Promise.withResolvers<never>();
-  #sendFailed = false;
+  // rejecting, so a rejected inner send must interrupt the (possibly already pending) receive
+  // and fail every receive after it.
+  #sendError: { err: unknown } | undefined = undefined;
+  // The abort handle of the receive() currently in flight, if any. Each receive gets its OWN
+  // promise to race against: racing every read against one session-lifetime failure promise
+  // retained a PromiseReaction (and that read's frame buffer) per message for the life of the
+  // session - the same trap RpcSessionImpl.readLoop documents for its cancel promise.
+  #pendingReceiveAbort: { promise: Promise<never>, reject: (reason?: unknown) => void } | undefined =
+      undefined;
 
   constructor(inner: CodecTransportInner, codec: Codec, options?: CodecTransportOptions) {
     this.#inner = inner;
@@ -55,9 +61,6 @@ export class CodecTransport implements RpcTransportWithCustomEncoding {
     this.#maxMessageSize = options?.maxMessageSize ?? DEFAULT_LIMITS.maxMessageSize;
     this.encodingLevel =
         codec.encodingLevel ?? (codec.binary ? "jsonCompatibleWithBytes" : "jsonCompatible");
-    // The failure promise may never be awaited (sessions that end cleanly); don't let its
-    // rejection surface as unhandled.
-    this.#sendFailure.promise.catch(() => {});
   }
 
   send(message: unknown): number | void {
@@ -66,9 +69,9 @@ export class CodecTransport implements RpcTransportWithCustomEncoding {
     let result = this.#inner.send(wire);
     if (result && typeof (result as Promise<void>).catch === "function") {
       (result as Promise<void>).catch(err => {
-        if (!this.#sendFailed) {
-          this.#sendFailed = true;
-          this.#sendFailure.reject(err);
+        if (this.#sendError === undefined) {
+          this.#sendError = { err };
+          this.#pendingReceiveAbort?.reject(err);
         }
       });
     }
@@ -76,15 +79,24 @@ export class CodecTransport implements RpcTransportWithCustomEncoding {
   }
 
   async receive(): Promise<unknown> {
-    let wire = await Promise.race([this.#inner.receive(), this.#sendFailure.promise]);
-    let normalized: string | Uint8Array =
-        wire instanceof ArrayBuffer ? new Uint8Array(wire) : wire;
-    let size = typeof normalized === "string" ? normalized.length : normalized.byteLength;
-    if (size > this.#maxMessageSize) {
-      throw new TypeError(
-          `Incoming message exceeds maximum size of ${this.#maxMessageSize}.`);
+    if (this.#sendError !== undefined) throw this.#sendError.err;
+    const abort = Promise.withResolvers<never>();
+    // May never be awaited (the read wins the race); don't let a later rejection go unhandled.
+    abort.promise.catch(() => {});
+    this.#pendingReceiveAbort = abort;
+    try {
+      let wire = await Promise.race([this.#inner.receive(), abort.promise]);
+      let normalized: string | Uint8Array =
+          wire instanceof ArrayBuffer ? new Uint8Array(wire) : wire;
+      let size = typeof normalized === "string" ? normalized.length : normalized.byteLength;
+      if (size > this.#maxMessageSize) {
+        throw new TypeError(
+            `Incoming message exceeds maximum size of ${this.#maxMessageSize}.`);
+      }
+      return this.#codec.decode(normalized);
+    } finally {
+      this.#pendingReceiveAbort = undefined;
     }
-    return this.#codec.decode(normalized);
   }
 
   abort(reason: any): void {

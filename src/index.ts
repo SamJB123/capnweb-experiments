@@ -7,6 +7,9 @@ import {
   RpcStub as RpcStubImpl,
   RpcPromise as RpcPromiseImpl,
   __experimental_debugRpcReference as __experimental_debugRpcReferenceImpl,
+  __experimental_streamCall as __experimental_streamCallImpl,
+  __experimental_releaseCall as __experimental_releaseCallImpl,
+  __experimental_onewayCall as __experimental_onewayCallImpl,
 } from "./core.js";
 import { serialize, deserialize, EncodingLevel } from "./serialize.js";
 import { RpcTransport, RpcTransportWithCustomEncoding, AnyRpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
@@ -235,6 +238,38 @@ export let __experimental_hibernatableWebSocketSessionId:
 export const __experimental_debugRpcReference:
     (value: unknown) => Record<string, unknown> =
     <any>__experimental_debugRpcReferenceImpl;
+
+/**
+ * Fire-and-forget call on a stub via the self-cleaning `["stream"]` path (auto-pulled and
+ * auto-released on both sessions). `args` is the argument list. The returned promise resolves
+ * once the receiver has processed the call - usable for backpressure, safe to ignore.
+ *
+ * Background: an ordinary un-awaited stub call leaves an unresolved import/export pair on both
+ * sessions (nothing pulls it, so nothing releases it). For hot, result-less calls use one of
+ * these three helpers instead; they differ only in what crosses the wire.
+ */
+export const __experimental_streamCall:
+    (stub: unknown, path: string | string[], args: unknown[]) => Promise<void> =
+    __experimental_streamCallImpl;
+
+/**
+ * Fire-and-forget via an ordinary push followed by an immediate release of the result. Unlike
+ * `__experimental_streamCall` the receiver sends nothing back; the only extra frame is the
+ * caller's outbound release. Both sessions still clean up fully.
+ */
+export const __experimental_releaseCall:
+    (stub: unknown, path: string | string[], args: unknown[]) => void =
+    __experimental_releaseCallImpl;
+
+/**
+ * True single-message fire-and-forget via the `["oneway"]` wire message: one outbound frame, no
+ * reply, no table entries on either side. Data calls only - the result is dropped and a failure
+ * is never reported back. Both peers must understand `["oneway"]` (this fork, 0.12.0-hibernation-cbor.1
+ * or later); through a resolved or local hook it degrades to call + dispose.
+ */
+export const __experimental_onewayCall:
+    (stub: unknown, path: string | string[], args: unknown[]) => void =
+    __experimental_onewayCallImpl;
 
 /**
  * Implements unified handling of HTTP-batch and WebSocket responses for the Cloudflare Workers
