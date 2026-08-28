@@ -4,7 +4,7 @@
 
 ### Hibernation fork
 
-- **Merged the CBOR experiment line into `main`** (`0.12.0-hibernation-cbor.0`, which itself merged upstream capnweb 0.12.0). The optional CBOR wire codec (`capnweb/codec/cbor`, `cbor-x` optional peer dependency) and the codec-transport architecture now ship on the main line; the default JSON wire format is unchanged. See the `0.12.0-hibernation-cbor.0` entry and the upstream 0.11.0–0.12.0 entries below for details.
+- **Merged upstream capnweb 0.12.0** (from the 0.10.0 base), via the `0.12.0-hibernation-cbor.0` experimental release. No new fork functionality: the optional CBOR codec was already part of this line (shipped on `latest` since `0.10.0-hibernation.1`). See the `0.12.0-hibernation-cbor.0` entry and the upstream 0.11.0–0.12.0 entries below for what changed.
 
 ## 0.12.0-hibernation-cbor.0
 
