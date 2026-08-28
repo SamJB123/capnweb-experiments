@@ -20,7 +20,7 @@ import type { RpcSessionDebugState } from "./rpc.js";
 import type { Codec } from "./codec/index.js";
 import { CodecTransport } from "./codec/transport.js";
 
-/** Close-frame reason max UTF-8 bytes: 125 payload − 2-byte status (RFC 6455 §5.5). */
+/** Close-frame reason max UTF-8 bytes: 125 payload - 2-byte status (RFC 6455 section 5.5). */
 export const MAX_CLOSE_REASON_BYTES = 125 - 2;
 
 export function newWebSocketRpcSession(
@@ -413,8 +413,8 @@ export async function __experimental_resumeHibernatableWebSocketRpcSession(
  * A session ID is stamped onto the WebSocket's attachment by
  * `__experimental_newHibernatableWebSocketRpcSession` the first time a
  * session is opened over it. The attachment survives hibernation, so this
- * is the right way — from inside `webSocketMessage`, `webSocketClose`, etc.
- * — to tell whether you've already seen a given WebSocket and can reuse a
+ * is the right way - from inside `webSocketMessage`, `webSocketClose`, etc.
+ * - to tell whether you've already seen a given WebSocket and can reuse a
  * cached session instance.
  *
  * The session ID is always on the attachment regardless of whether a

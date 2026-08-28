@@ -1,5 +1,17 @@
 # capnweb
 
+## 0.12.0-hibernation.0
+
+### Hibernation fork
+
+- **Merged the CBOR experiment line into `main`** (`0.12.0-hibernation-cbor.0`, which itself merged upstream capnweb 0.12.0). The optional CBOR wire codec (`capnweb/codec/cbor`, `cbor-x` optional peer dependency) and the codec-transport architecture now ship on the main line; the default JSON wire format is unchanged. See the `0.12.0-hibernation-cbor.0` entry and the upstream 0.11.0–0.12.0 entries below for details.
+
+## 0.12.0-hibernation-cbor.0
+
+### CBOR experiment line
+
+- **Merged upstream capnweb 0.12.0** (from the 0.10.0 base). Notable upstream additions now in the fork: `RpcPromise` constructible from a `Promise` (with stub elision on the result type), argument/capture leak fixes on call failure paths, ArrayBuffer / typed-array / `URL` serialization, `setImmediate` batch flushing, the new `packages/docs` documentation site, and ASCII-only dist enforcement. The root `protocol.md` is gone upstream; the fork's caller-chosen `importId` wording for `push` / `stream` / `pipe` now lives in `packages/docs/src/content/docs/reference/protocol.md`. All hibernation and CBOR functionality is preserved on top; see the upstream 0.11.0–0.12.0 entries below for details.
+
 ## 0.10.0-hibernation-cbor.1
 
 ### CBOR experiment line
@@ -132,6 +144,47 @@ Rebased the `capnweb-experimental-hibernation` fork onto upstream `capnweb` 0.8.
 - `HibernatableWebSocketSession<T>` is now generic and `getRemoteMain()` returns `RpcStub<T>`. Both `__experimental_newHibernatableWebSocketRpcSession<T>` and `__experimental_resumeHibernatableWebSocketRpcSession<T>` now thread `T` through to the returned session, eliminating the need for `as unknown as RpcStub<T>` at every call site that needs the worker-side capability.
 - Fixed an import-table leak in `sendCall`, `sendStream`, and `sendMap` when the args payload fails to serialize (e.g. non-serializable argument). The import-table entry is now allocated *after* `Devaluator.devaluate` succeeds, mirroring the upstream first-party shape and avoiding the orphan slot left behind on throw.
 - Fixed an export leak / spurious `toJSON` RPC call triggered by snapshot capture in the `push` and `stream` receive handlers. `cloneRpcExpr(msg[2])` is now called once *before* `evaluateWithCurrentProvenance` mutates the expression in place; reusing the pre-mutation clone for both `importReplays` and `sourceExpr` prevents `JSON.stringify` from probing live `RpcStub` proxies created during evaluation.
+
+## 0.12.0
+
+### Minor Changes
+
+- [#253](https://github.com/cloudflare/capnweb/pull/253) [`46de5a7`](https://github.com/cloudflare/capnweb/commit/46de5a7503e09242755c1bc59e67bdac37a5e8ab) Thanks [@ndisidore](https://github.com/ndisidore)! - Fixed methods declared to return `Promise<RpcStub<T>>` producing broken stub-of-stub result types; they now type the same as `Promise<T>`. If you annotated such a result as `RpcPromise<RpcStub<T>>`, write `RpcPromise<T>` instead.
+
+- [#242](https://github.com/cloudflare/capnweb/pull/242) [`9751a4e`](https://github.com/cloudflare/capnweb/commit/9751a4eb7422712c92b8a5c2100bc3a562e0a433) Thanks [@ndisidore](https://github.com/ndisidore)! - `RpcPromise` can now be constructed from a `Promise`: pipelined calls queue in order until it settles, so you can publish a capability that doesn't exist yet.
+
+### Patch Changes
+
+- [#241](https://github.com/cloudflare/capnweb/pull/241) [`2de5871`](https://github.com/cloudflare/capnweb/commit/2de5871421d852c8d5a3db241ce6f5648db3104a) Thanks [@ndisidore](https://github.com/ndisidore)! - Fix RPC argument and capture leaks on failure paths: call arguments are now reliably disposed when a call is rejected, delivered to a broken or disposed stub, or fails to serialize.
+
+- [#251](https://github.com/cloudflare/capnweb/pull/251) [`7a6e5da`](https://github.com/cloudflare/capnweb/commit/7a6e5da8cf9d14f766e35dd9b07aab5637803e11) Thanks [@ndisidore](https://github.com/ndisidore)! - The `RpcPromise` constructor now applies the same stub elision as method result types: wrapping a `Promise<RpcStub<T>>` produces the same `RpcPromise<T>` a method declared to return that stub would, plain-interface stub payloads keep their stub type, and promises resolving to inline object literals with methods now infer correctly.
+
+- [#243](https://github.com/cloudflare/capnweb/pull/243) [`7e864a8`](https://github.com/cloudflare/capnweb/commit/7e864a872bab9f810f24f43c478af64c6c773b00) Thanks [@ndisidore](https://github.com/ndisidore)! - Fix WritableStream stubs leaking call arguments when the stub was already disposed or the call path was invalid. All failure paths in `WritableStreamStubHook.call()` now dispose the copied arguments, matching ReadableStream behavior.
+
+## 0.11.1
+
+### Patch Changes
+
+- [#239](https://github.com/cloudflare/capnweb/pull/239) [`667958e`](https://github.com/cloudflare/capnweb/commit/667958e65517990afce7916e7fafa72cca67c525) Thanks [@Maximo-Guk](https://github.com/Maximo-Guk)! - Keep the published runtime bundles ASCII-only. A doc comment introduced in 0.11.0 carried a U+2212 into every dist bundle, which breaks consumers that inline the bundle through Latin-1-only APIs like `btoa()`. The comment is fixed and the build now fails if any non-ASCII byte reaches a runtime bundle in `dist/`.
+
+## 0.11.0
+
+### Minor Changes
+
+- [#212](https://github.com/cloudflare/capnweb/pull/212) [`1cca1a2`](https://github.com/cloudflare/capnweb/commit/1cca1a212da1e8bc4f807725d96702f0b78207e1) Thanks [@codehz](https://github.com/codehz)! - Support RpcTargets (and other RPC stubs) as ReadableStream/WritableStream chunks without disposing their capabilities when `write()` returns. Stream chunk payloads now keep lifecycle tied to the chunk (via `Symbol.dispose` when needed) so methods on streamed stubs remain usable after the write resolves.
+
+- [#201](https://github.com/cloudflare/capnweb/pull/201) [`7325f9d`](https://github.com/cloudflare/capnweb/commit/7325f9d5c80dd57fea896bb4696d22a102cf10a8) Thanks [@ttmx](https://github.com/ttmx)! - Support exact ArrayBuffer, DataView, and typed array serialization over RPC.
+
+- [#224](https://github.com/cloudflare/capnweb/pull/224) [`064b0f3`](https://github.com/cloudflare/capnweb/commit/064b0f352a5928caa91fe8a1fbc1c717c4b1ee09) Thanks [@dimitropoulos](https://github.com/dimitropoulos)! - Support serializing `URL` objects over RPC.
+
+### Patch Changes
+
+- [#220](https://github.com/cloudflare/capnweb/pull/220) [`43aa384`](https://github.com/cloudflare/capnweb/commit/43aa384b211f180c6b91ec7d2aa9acf4b57b3fcd) Thanks [@ndisidore](https://github.com/ndisidore)! - Remove the ~1ms per-batch latency floor in the HTTP batch client on Node and Bun by flushing via `setImmediate` instead of the clamped `setTimeout(0)`.
+
+- [#214](https://github.com/cloudflare/capnweb/pull/214) [`2a02db9`](https://github.com/cloudflare/capnweb/commit/2a02db961460c222b0643a92483255613c7f78d5) Thanks [@ndisidore](https://github.com/ndisidore)! - The RPC `ReadableStream` type accepts any RPC-compatible chunk type, matching `WritableStream`.
+
+- [#238](https://github.com/cloudflare/capnweb/pull/238) [`1a1f0d4`](https://github.com/cloudflare/capnweb/commit/1a1f0d419b13de0cf78d611cf9b1c99bc650dc7c) Thanks [@Maximo-Guk](https://github.com/Maximo-Guk)! - Share one `RpcPromise` alias between `Result` and the public export. Deeply-nested RPC interfaces no longer blow the checker's depth budget: this fixes all "excessively deep" / "excessive stack depth" (TS2589/TS2321) errors under TypeScript 7 (tsgo) and reduces TypeScript 5.9 type instantiations by ~13%. `RpcPromise<T>` for primitive `T` now also carries the pipelining `Provider<T>` surface, matching what stub calls already returned.
+
 ## 0.10.0
 
 ### Minor Changes
