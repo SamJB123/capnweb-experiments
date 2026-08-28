@@ -369,6 +369,19 @@ export abstract class StubHook {
     return { promise };
   }
 
+  // Fire-and-forget call: invoke the function at `path` and discard the result. No promise is
+  // returned, nothing is pulled, and nothing needs releasing. The default delegates to call()
+  // and disposes the result hook; the remote hook overrides this to emit a single ["oneway"]
+  // frame that allocates no table entry on either session.
+  //
+  // DATA CALLS ONLY: the result is dropped unseen and a failure is never reported back, so this
+  // is only appropriate for calls whose outcome the caller does not need to learn about.
+  //
+  // oneway() takes ownership of `args` under the same rules as call().
+  oneway(path: PropertyPath, args: RpcPayload): void {
+    this.call(path, args).dispose();
+  }
+
   // Apply a map operation.
   //
   // `captures` is a list of external stubs which are used as part of the mapper function.
@@ -2232,6 +2245,76 @@ export function __experimental_debugRpcReference(value: unknown): Record<string,
     pathIfPromise: raw.pathIfPromise ?? null,
     hook: __experimental_debugStubHookIdentity(raw.hook),
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fire-and-forget calls
+//
+// An ordinary un-awaited stub call is a "push": the caller allocates an import entry for the
+// result and the callee an export entry, and because nobody ever pulls the result, nothing ever
+// resolves or releases them - measured at ~7.6KB retained per call on BOTH sessions. The three
+// helpers below are for hot, result-less calls (presence heartbeats, motion updates) and differ
+// only in what crosses the wire:
+//
+//   streamCall   ["stream"]         auto-pulled + auto-released; the receiver echoes one resolve
+//                                   back per call (an INBOUND cost on a hot-sending peer). The
+//                                   returned promise settles when the receiver has processed the
+//                                   call - usable for backpressure, safe to ignore.
+//   releaseCall  ["push"]+["release"]  no receiver echo; the only extra frame is the caller's
+//                                   outbound release. Both sides still clean up fully (the call
+//                                   executes on push arrival, in order; the release drops the export).
+//   onewayCall   ["oneway"]         one outbound frame, no reply, no table entries anywhere. Both
+//                                   peers must speak the ["oneway"] message (this fork, >= 0.12.0-hibernation.1
+//                                   or 0.12.0-hibernation-cbor.1); through a resolved/local hook it
+//                                   degrades to call+dispose, and a relay hop forwards it as
+//                                   push+release on its onward leg.
+
+function fireAndForgetHook(stub: unknown, what: string): StubHook {
+  if (!(stub instanceof RpcStub)) {
+    throw new TypeError(`${what}: expected an RpcStub, got ${typeof stub}.`);
+  }
+  let hook = unwrapStubNoProperties(stub);
+  if (!hook) {
+    throw new TypeError(
+        `${what}: the stub carries a property path; pass the target stub and the path separately.`);
+  }
+  return hook;
+}
+
+function normalizePath(path: string | string[]): PropertyPath {
+  return typeof path === "string" ? [path] : path;
+}
+
+/**
+ * Fire-and-forget call on `stub` via the self-cleaning `["stream"]` path: auto-pulled and
+ * auto-released on both sessions. `args` is the argument list. The returned promise resolves
+ * once the receiver has processed the call - usable for backpressure, safe to ignore.
+ */
+export function __experimental_streamCall(
+    stub: unknown, path: string | string[], args: unknown[]): Promise<void> {
+  let hook = fireAndForgetHook(stub, "__experimental_streamCall");
+  return hook.stream(normalizePath(path), RpcPayload.fromAppParams(args)).promise;
+}
+
+/**
+ * Fire-and-forget call via an ordinary push followed by an immediate release of the result.
+ * The receiver sends nothing back; both sessions still clean up fully.
+ */
+export function __experimental_releaseCall(
+    stub: unknown, path: string | string[], args: unknown[]): void {
+  let hook = fireAndForgetHook(stub, "__experimental_releaseCall");
+  hook.call(normalizePath(path), RpcPayload.fromAppParams(args)).dispose();
+}
+
+/**
+ * True single-message fire-and-forget via the `["oneway"]` wire message: one outbound frame,
+ * no reply, no table entries on either side. Data calls only - the result is dropped and a
+ * failure is never reported. Both peers must understand `["oneway"]`.
+ */
+export function __experimental_onewayCall(
+    stub: unknown, path: string | string[], args: unknown[]): void {
+  let hook = fireAndForgetHook(stub, "__experimental_onewayCall");
+  hook.oneway(normalizePath(path), RpcPayload.fromAppParams(args));
 }
 
 // StubHook derived from a Promise for some other StubHook. Waits for the promise and then

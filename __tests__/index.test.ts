@@ -4213,3 +4213,72 @@ describe("deserialization and transport correctness", () => {
     expect(sentReason).toBe("a".repeat(MAX_CLOSE_REASON_BYTES - 1));
   });
 });
+
+import { __experimental_onewayCall, __experimental_releaseCall, __experimental_streamCall,
+         RpcTarget as FfRpcTarget } from "../src/index.js";
+
+class FireAndForgetSink extends FfRpcTarget {
+  seen: number[] = [];
+  note(i: number) { this.seen.push(i); }
+  fail() { throw new Error("nope"); }
+}
+
+describe("fire-and-forget calls", () => {
+  it("onewayCall delivers in order and allocates no table entries on either side", async () => {
+    let sink = new FireAndForgetSink();
+    await using harness = new TestHarness(sink);
+
+    __experimental_onewayCall(harness.stub, "note", [1]);
+    __experimental_onewayCall(harness.stub, ["note"], [2]);
+    // Nothing was allocated for the calls themselves, even before delivery.
+    harness.checkAllDisposed();
+
+    await pumpMicrotasks();
+    expect(sink.seen).toEqual([1, 2]);
+    harness.checkAllDisposed();
+  });
+
+  it("onewayCall to a throwing method is dropped without aborting the session", async () => {
+    let sink = new FireAndForgetSink();
+    await using harness = new TestHarness(sink);
+
+    __experimental_onewayCall(harness.stub, "fail", []);
+    __experimental_onewayCall(harness.stub, "note", [3]);
+    await pumpMicrotasks();
+
+    expect(sink.seen).toEqual([3]);
+    // The session is still usable afterwards.
+    expect(await harness.stub.note(4)).toBe(undefined);
+    expect(sink.seen).toEqual([3, 4]);
+  });
+
+  it("releaseCall delivers and both sessions clean up", async () => {
+    let sink = new FireAndForgetSink();
+    await using harness = new TestHarness(sink);
+
+    __experimental_releaseCall(harness.stub, "note", [5]);
+    await pumpMicrotasks();
+    expect(sink.seen).toEqual([5]);
+    harness.checkAllDisposed();
+  });
+
+  it("streamCall delivers, resolves once processed, and both sessions clean up", async () => {
+    let sink = new FireAndForgetSink();
+    await using harness = new TestHarness(sink);
+
+    await __experimental_streamCall(harness.stub, "note", [6]);
+    expect(sink.seen).toEqual([6]);
+    await pumpMicrotasks();
+    harness.checkAllDisposed();
+  });
+
+  it("rejects non-stub targets and property stubs", async () => {
+    let sink = new FireAndForgetSink();
+    await using harness = new TestHarness(sink);
+
+    expect(() => __experimental_onewayCall({}, "note", [1])).toThrow(TypeError);
+    // A property path on the stub is refused: pass the target stub and the path separately.
+    expect(() => __experimental_onewayCall((harness.stub as any).note, "call", [1]))
+        .toThrow(TypeError);
+  });
+});
