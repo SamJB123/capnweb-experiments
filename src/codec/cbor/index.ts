@@ -70,7 +70,7 @@ function decodeGuard(wire: string | Uint8Array): Uint8Array {
  *
  * ## Stateless (default)
  *
- * `useRecords: false` — each message is fully self-contained. Hibernation-safe
+ * `useRecords: false` - each message is fully self-contained. Hibernation-safe
  * with no extra work, since there is no accumulated state to lose.
  *
  * ## Stateful (`{ stateful: true }`)
@@ -80,23 +80,23 @@ function decodeGuard(wire: string | Uint8Array): Uint8Array {
  * direction), mirroring the export/import asymmetry of the RPC session itself:
  *
  * - The **decoder** table (shapes the peer defined, that we learned) MUST survive
- *   hibernation — the peer keeps sending definition-less references to those ids.
+ *   hibernation - the peer keeps sending definition-less references to those ids.
  *   `snapshotState()` captures it; `restoreState()` re-seeds a fresh decoder.
  * - The **encoder** table needs nothing: a structure definition is self-describing
  *   on the wire, so a fresh encoder simply re-emits definitions on resume (a few
  *   larger messages until it re-warms). This is the one place the codec is even
  *   simpler than capability hibernation, which needs provenance to rebuild live
  *   objects. (cbor-x also doesn't expose the encoder's table, so restarting it
- *   fresh is the only option — but as below, it's also the *correct* one.)
+ *   fresh is the only option - but as below, it's also the *correct* one.)
  *
  * ### Why restarting the encoder fresh is correct (not just convenient)
  *
- * cbor-x structure ids are **absolute** — baked into the CBOR record tag, not
+ * cbor-x structure ids are **absolute** - baked into the CBOR record tag, not
  * positional. So when a fresh encoder re-defines a shape, the peer's decoder
  * **overwrites** the slot at that id rather than appending. And a fresh encoder
  * always emits a definition (overwriting the peer's slot) **before** it ever
  * references that id. Therefore every definition-less reference it later sends
- * points at a slot it just redefined and the peer just overwrote — they cannot
+ * points at a slot it just redefined and the peer just overwrote - they cannot
  * disagree, even if the fresh encoder assigns ids in a different order than
  * before hibernation. Re-defining is self-correcting; this is why we never need
  * to preserve encoder state.
@@ -106,7 +106,7 @@ function decodeGuard(wire: string | Uint8Array): Uint8Array {
  * Because ids reset to 0 each connection-life and definitions overwrite, a
  * receiver's decoder table (what it persists in its DO WebSocket attachment)
  * does NOT accumulate across the peer's repeated hibernations. Its length equals
- * the most distinct object shapes the peer defined in any *single* life — not the
+ * the most distinct object shapes the peer defined in any *single* life - not the
  * sum across lives. Slots above the current life's shape count may hold harmless
  * stale leftovers (never referenced, since the fresh encoder only references ids
  * it redefined this life); there is no active GC, but the overwrite behavior caps

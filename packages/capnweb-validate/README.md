@@ -12,6 +12,8 @@ error instead of silently running without validation.
 
 ## Install
 
+Two packages, or one if you are on Workers RPC:
+
 ```sh
 npm install capnweb capnweb-validate
 ```
@@ -21,6 +23,9 @@ The root package has no runtime dependency on `capnweb`; Cap'n Web-specific
 helpers live under `capnweb-validate/capnweb` and internal transform outputs.
 
 ## Server Usage
+
+Decorate the class you expose. Every call that arrives is checked against the
+method's declared parameter types before your code runs:
 
 ```ts
 import { newWorkersRpcResponse, RpcTarget } from "capnweb";
@@ -197,9 +202,9 @@ try {
 
 Where errors surface depends on which boundary failed:
 
-| Boundary | Failure | How it surfaces |
-| -------- | ------- | --------------- |
-| Client stub | Bad resolved return | The returned promise rejects. |
+| Boundary      | Failure               | How it surfaces                                             |
+| ------------- | --------------------- | ----------------------------------------------------------- |
+| Client stub   | Bad resolved return   | The returned promise rejects.                               |
 | Server target | Bad incoming argument | The server throws and the caller observes an RPC rejection. |
 
 ## Current Type Coverage
@@ -243,12 +248,12 @@ not match the supported `Blob` validator.
 transform refuses to compile a service that uses them so the user finds out at
 build time, not at the first RPC call:
 
-| Type               | Build error hint                                           |
-| ------------------ | ---------------------------------------------------------- |
-| `WeakMap`          | `WeakMap` is not a supported RPC validation type.          |
-| `WeakSet`          | `WeakSet` is not a supported RPC validation type.          |
-| `SharedArrayBuffer`| `SharedArrayBuffer` is not a supported RPC validation type.|
-| `File`             | Use a `Blob` or `Uint8Array`; `File` is not supported.     |
+| Type                | Build error hint                                            |
+| ------------------- | ----------------------------------------------------------- |
+| `WeakMap`           | `WeakMap` is not a supported RPC validation type.           |
+| `WeakSet`           | `WeakSet` is not a supported RPC validation type.           |
+| `SharedArrayBuffer` | `SharedArrayBuffer` is not a supported RPC validation type. |
+| `File`              | Use a `Blob` or `Uint8Array`; `File` is not supported.      |
 
 If a method signature contains a leaf the resolver cannot lower, such as a generic
 type parameter with no inference source, an unsupported recursive corner, or a rejected
@@ -266,6 +271,35 @@ would reject valid calls to the others. Overloaded methods are passed through
 unvalidated with a warning. Collapse the overloads into a single signature with
 union parameters to validate the method, or `@skipRpcValidation()` to silence
 the warning.
+
+## Schema Evolution
+
+A validator built from one version of your types may receive values from a peer
+built from another.
+
+| Change                                | Result  |
+| ------------------------------------- | ------- |
+| Extra argument                        | Allowed |
+| Extra object property                 | Allowed |
+| Extra index-signature key             | Allowed |
+| New optional parameter / property     | Allowed |
+| Missing required parameter / property | Refused |
+| Renamed or retyped member             | Refused |
+| Changed tuple length, no rest element | Refused |
+| New union member                      | Refused |
+| New method                            | Refused |
+
+Remove a required member by making it optional in one release and deleting it in
+a later one.
+
+Extra arguments to a validated method are dropped before it runs, but extra
+object properties are forwarded to the implementation unvalidated. An index
+signature is the exception: it validates every property outside the declared
+ones.
+
+Keep `strictNullChecks` on. Without it TypeScript erases `null` from your types
+and the generated validator refuses a `null` that a peer built with it considers
+valid.
 
 ## License
 

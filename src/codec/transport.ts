@@ -23,7 +23,7 @@ export interface CodecTransportOptions {
   /**
    * Maximum incoming wire-message size (bytes for binary frames, UTF-16 code units for text)
    * enforced BEFORE the codec decodes. Guards against resource-exhaustion from an untrusted
-   * peer — the core session only applies its `maxMessageSize` limit at the "string" encoding
+   * peer - the core session only applies its `maxMessageSize` limit at the "string" encoding
    * level, so the codec transport polices its own frames. Defaults to
    * `DEFAULT_LIMITS.maxMessageSize`. An over-limit frame rejects `receive()`, aborting the
    * session (matching the "string"-level semantics).
@@ -36,7 +36,7 @@ export interface CodecTransportOptions {
  * this transport already-devalued message trees (at the codec's declared encoding level), the
  * codec turns them into bytes/text for the inner transport, and vice versa on receive.
  *
- * Most callers never construct this directly — passing `RpcSessionOptions.codec` wraps the
+ * Most callers never construct this directly - passing `RpcSessionOptions.codec` wraps the
  * session's transport in a `CodecTransport` automatically.
  */
 export class CodecTransport implements RpcTransportWithCustomEncoding {

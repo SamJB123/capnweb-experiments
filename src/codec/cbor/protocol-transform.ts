@@ -2,18 +2,18 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-// no-eval build — see the note in ./index.ts (avoids `new Function` codegen that
+// no-eval build - see the note in ./index.ts (avoids `new Function` codegen that
 // Cloudflare Workers / strict CSP disallow). Same API and wire format.
 import { addExtension } from "cbor-x/index-no-eval";
 
 /**
  * Optional "envelope optimization" for the CBOR codec.
  *
- * capnweb's devalued wire form is tagged ARRAYS — `["push", id, …]`,
- * `["pipeline", …]`, a method path `["setPose"]`, `["bytes", b64]`, etc. cbor-x's
+ * capnweb's devalued wire form is tagged ARRAYS - `["push", id, ...]`,
+ * `["pipeline", ...]`, a method path `["setPose"]`, `["bytes", b64]`, etc. cbor-x's
  * structure-sharing only compresses repeating *object* shapes, so those repeated
  * protocol/method strings ship in full on every message. This module reshapes
- * every string-headed array into a one-key map `{ <head>: [rest…] }` carried under
+ * every string-headed array into a one-key map `{ <head>: [rest...] }` carried under
  * a private CBOR tag, so cbor-x record-sharing can dedupe the head (the tag /
  * method name) across messages.
  *
@@ -21,32 +21,32 @@ import { addExtension } from "cbor-x/index-no-eval";
  *
  * - The reshape is a **total, injective bijection**. Encode replaces every
  *   string-headed array with a {@link ProtocolToken} (written under a private CBOR
- *   tag); everything else — objects, primitives, and arrays whose head is *not* a
- *   string — is structurally untouched. Decode is the exact inverse.
+ *   tag); everything else - objects, primitives, and arrays whose head is *not* a
+ *   string - is structurally untouched. Decode is the exact inverse.
  * - The CBOR tag is a **disjoint namespace**. capnweb's devaluator only ever emits
- *   the JSON data model (strings/numbers/bool/null/arrays/objects) — it never
- *   emits a CBOR tag — so a tag on the wire can *only* have been written by this
- *   transform. Therefore a user object `{push:[…]}` stays an **untagged map** and
- *   decodes back to an object; it can never be mistaken for a `["push", …]` token.
+ *   the JSON data model (strings/numbers/bool/null/arrays/objects) - it never
+ *   emits a CBOR tag - so a tag on the wire can *only* have been written by this
+ *   transform. Therefore a user object `{push:[...]}` stays an **untagged map** and
+ *   decodes back to an object; it can never be mistaken for a `["push", ...]` token.
  *   The disjointness is structural (by CBOR major type), not dependent on the walk
  *   visiting every node.
  * - Because decode is the exact inverse of encode, the reconstructed array tree is
  *   identical to what capnweb produced; capnweb's `Evaluator` then interprets it
  *   *positionally* exactly as it would for the JSON path. The transform adds no new
- *   interpretation, so it introduces no new bleed vector — capnweb's `Evaluator`
+ *   interpretation, so it introduces no new bleed vector - capnweb's `Evaluator`
  *   remains the sole boundary against malicious peers (who could already craft any
  *   token over plain JSON).
  *
- * Note: genuine user arrays are escaped by capnweb to `[[…]]` (array-headed), so
+ * Note: genuine user arrays are escaped by capnweb to `[[...]]` (array-headed), so
  * they are never string-headed and never become tokens. A user array *of strings*
- * (`["a","b"]`) is reshaped internally but round-trips faithfully — it is
+ * (`["a","b"]`) is reshaped internally but round-trips faithfully - it is
  * reconstructed to the identical array and un-escaped positionally by capnweb.
  *
  * ## Extensibility toward "skeleton + quarantined values" (option #5)
  *
  * {@link toProtocolTokens} is the single encode seam. A #5 variant would, at
  * user-data leaf nodes, push the value onto a side channel and emit a placeholder
- * here instead of inlining it — reusing the same token-detection rule, with the
+ * here instead of inlining it - reusing the same token-detection rule, with the
  * decode side reading values back from that channel. The shape below (one pure
  * walk + a self-inverse tag extension) is intended to make that change local.
  */

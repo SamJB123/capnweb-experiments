@@ -17,17 +17,17 @@ export interface WebCryptoSnapshotSecurityOptions {
 /**
  * A ready-made {@link HibernatableSnapshotSecurity} backed by WebCrypto: AES-GCM
  * for confidentiality+integrity and a keyed HMAC fingerprint for write-elision.
- * This is the recommended way to protect hibernation snapshots — pass the result
+ * This is the recommended way to protect hibernation snapshots - pass the result
  * as `snapshotSecurity` when creating a hibernatable session.
  *
  * Why this exists, and the one rule that makes it secure: a hibernation snapshot
  * (which carries `importReplays` that are re-executed on wake) is persisted in
  * Durable Object storage / the WebSocket attachment. If an attacker can WRITE
  * that storage, the only thing that stops a forged snapshot from being restored
- * and replayed is a verification key the attacker cannot reach — and the
+ * and replayed is a verification key the attacker cannot reach - and the
  * library's own storage IS the thing under attack. So the key MUST come from
  * outside that store. Pass a `secret` sourced from a Worker secret binding
- * (`wrangler secret put …`) or a KMS — never from DO storage or client input.
+ * (`wrangler secret put ...`) or a KMS - never from DO storage or client input.
  *
  * Both subkeys are derived from `secret` via SHA-256 with distinct domain-
  * separation labels, so a single high-entropy secret is sufficient. The wire
