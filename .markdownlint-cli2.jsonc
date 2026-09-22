@@ -68,7 +68,9 @@
     "!.github/**/*.md",
 
     "!**/node_modules/**",
-    "!**/dist/**"
+    "!**/dist/**",
+    "!**/.astro/**",
+    "!**/.nimbus/**"
   ],
 
   // `.mdx` is deliberately absent from the globs above. markdownlint has no

@@ -115,6 +115,33 @@ class TestApi extends RpcTarget {
 }
 
 describe("CBOR codec over an RPC session", () => {
+  it.each([
+    {},
+    { stateful: true },
+    { optimizeEnvelope: true },
+    { structuredClone: true },
+    { stateful: true, optimizeEnvelope: true },
+    { stateful: true, structuredClone: true },
+    { optimizeEnvelope: true, structuredClone: true },
+    { stateful: true, optimizeEnvelope: true, structuredClone: true },
+  ])("round-trips upstream RegExp values with CBOR options %j", async options => {
+    const [clientTransport, serverTransport] = makePair();
+    const server = new RpcSession(
+      withCodec(serverTransport, createCborCodec(options)), new TestApi());
+    const client = new RpcSession<TestApi>(
+      withCodec(clientTransport, createCborCodec(options)));
+    using remote = client.getRemoteMain();
+    using local = server.getRemoteMain();
+    for (const input of [/foo\d+/gi, /^bar$/]) {
+      const result = await remote.echo({ nested: [input] }) as { nested: RegExp[] };
+      expect(result.nested[0]).toBeInstanceOf(RegExp);
+      expect(result.nested[0].source).toBe(input.source);
+      expect(result.nested[0].flags).toBe(input.flags);
+    }
+    expect(clientTransport.sawBinary).toBe(true);
+    expect(serverTransport.sawBinary).toBe(true);
+  });
+
   it("makes calls end-to-end and actually sends binary frames", async () => {
     const codec = createCborCodec();
     const [clientTransport, serverTransport] = makePair();

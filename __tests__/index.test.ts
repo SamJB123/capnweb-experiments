@@ -43,6 +43,9 @@ let SERIALIZE_TEST_CASES: Record<string, unknown> = {
 
   '["url","https://example.com/path?q=1"]': new URL("https://example.com/path?q=1"),
 
+  '["regexp","foo\\\\d+","gi"]': /foo\d+/gi,
+  '["regexp","^bar$"]': /^bar$/,
+
   '["headers",[]]': new Headers(),
   '["headers",[["content-type","text/plain"],["x-custom","hello"]]]':
       new Headers({"Content-Type": "text/plain", "X-Custom": "hello"}),
@@ -2992,11 +2995,15 @@ describe("WritableStream over RPC", () => {
               // pumping, which can be slow under load / on WebKit (see notes above). The logic is
               // constant; only the wall-clock drain time varies, so a larger budget avoids flakes.
 
-  it("applies backpressure when custom transport omits stream message size", async () => {
+  it.each([
+    ["jsonCompatible", "x".repeat(40000)],
+    ["structuredClonable", new RegExp("x".repeat(40000), "gi")],
+  ] as const)("applies backpressure when custom transport omits stream message size (%s)",
+      async (encodingLevel, chunk) => {
     let writesReceived = 0;
     let closeReceived = false;
 
-    let stream = new WritableStream<string>({
+    let stream = new WritableStream<string | RegExp>({
       write(chunk) { writesReceived++; },
       close() { closeReceived = true; }
     });
@@ -3004,9 +3011,8 @@ describe("WritableStream over RPC", () => {
     let writesSent = 0;
 
     class StreamReceiver extends RpcTarget {
-      async receiveStream(stream: WritableStream<string>) {
+      async receiveStream(stream: WritableStream<string | RegExp>) {
         let writer = stream.getWriter();
-        let chunk = "x".repeat(40000);
         for (let i = 0; i < 20; i++) {
           writesSent++;
           await writer.write(chunk);
@@ -3015,8 +3021,8 @@ describe("WritableStream over RPC", () => {
       }
     }
 
-    let clientTransport = new ObjectTestTransport();
-    let serverTransport = new ObjectTestTransport(clientTransport);
+    let clientTransport = new ObjectTestTransport(undefined, encodingLevel);
+    let serverTransport = new ObjectTestTransport(clientTransport, encodingLevel);
     let client = new RpcSession<StreamReceiver>(clientTransport);
     new RpcSession(serverTransport, new StreamReceiver());
     using clientStub = client.getRemoteMain();
@@ -3307,6 +3313,16 @@ describe("transport encoding levels", () => {
       let date = await stub.echo(new Date(1234567890)) as Date;
       expect(date).toBeInstanceOf(Date);
       expect(date.getTime()).toBe(1234567890);
+
+      let re = await stub.echo(/foo\d+/gi) as RegExp;
+      expect(re).toBeInstanceOf(RegExp);
+      expect(re.source).toBe("foo\\d+");
+      expect(re.flags).toBe("gi");
+
+      let bare = await stub.echo(/^bar$/) as RegExp;
+      expect(bare).toBeInstanceOf(RegExp);
+      expect(bare.source).toBe("^bar$");
+      expect(bare.flags).toBe("");
 
       expect(await stub.echo(123n)).toBe(123n);
     });

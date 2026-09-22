@@ -1,5 +1,11 @@
 # capnweb
 
+## Unreleased
+
+- Merge upstream through `31f8edc`: RegExp serialization, source-preserving mapped types, pnpm workspace tooling, and updated Nimbus/MDX documentation.
+- Preserve native RegExp values in the fork's CBOR envelope optimizer, including structured-clone mode. All eight CBOR option combinations have round-trip coverage.
+- Retain fork-specific hibernation replay cleanup, optional codecs, explicit message IDs, fire-and-forget helpers, and protocol documentation.
+
 ## 0.12.0-hibernation.2
 
 ### Hibernation fork

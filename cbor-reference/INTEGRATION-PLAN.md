@@ -18,11 +18,11 @@ codec, reference only) and `cbor-reference/README.md` (why we started fresh).
 All wire (de)serialization funnels through a single thin layer in `rpc.ts`, sitting **on
 top of** the `Devaluator`/`Evaluator` in `serialize.ts`:
 
-| Direction   | Location                          | Today                                                     |
-|-------------|-----------------------------------|-----------------------------------------------------------|
-| Send        | `RpcSession.send()` `rpc.ts:831`  | `JSON.stringify(msg)` → `transport.send(string)`          |
-| Send (abort)| `rpc.ts:967`                      | `transport.send(JSON.stringify(["abort", …]))` (bypasses `send()`) |
-| Receive     | `readLoop()` `rpc.ts:1032`        | `transport.receive()` → `JSON.parse(msgText)`             |
+| Direction    | Location                         | Today                                                              |
+| ------------ | -------------------------------- | ------------------------------------------------------------------ |
+| Send         | `RpcSession.send()` `rpc.ts:831` | `JSON.stringify(msg)` → `transport.send(string)`                   |
+| Send (abort) | `rpc.ts:967`                     | `transport.send(JSON.stringify(["abort", …]))` (bypasses `send()`) |
+| Receive      | `readLoop()` `rpc.ts:1032`       | `transport.receive()` → `JSON.parse(msgText)`                      |
 
 `msg` is **already devalued** — plain arrays/objects/primitives (cap'n web's array-token
 form). A codec swaps only the `JSON.stringify`/`JSON.parse` step; `Devaluator`/`Evaluator`
@@ -77,7 +77,7 @@ The **entire core footprint is ~6 small edits** in `rpc.ts` plus a one-field typ
 
 All CBOR logic lives in its own tree; nothing CBOR-specific leaks into core files:
 
-```
+```text
 src/codec/
   index.ts          Codec interface + jsonCodec (default)
   json.ts           JsonCodec
@@ -115,6 +115,7 @@ Each branches on type, so the JSON path is unchanged and the binary path is adde
 
 Simplest, no protocol change, fully meets "optional." Document that client and server must
 construct with the same codec. Layerable later:
+
 - HTTP batch: auto-detect via `Content-Type: application/cbor` / `Accept`.
 - WebSocket: a subprotocol (`Sec-WebSocket-Protocol: capnweb.cbor`) or sniff the first frame's
   type (string → json, binary → cbor).
@@ -141,9 +142,11 @@ resume. This is what killed the old branch. The fix reuses main's *working* snap
 
 1. Codec gains optional `snapshotState()` / `restoreState()` (see Goal 1 interface).
 2. `RpcSessionSnapshot` (`hibernation.ts:37`) gains an optional field and bumps to version 3:
+
    ```ts
    codec?: { id: string; state: unknown };   // state is JSON-serializable
    ```
+
 3. `__experimental_snapshot()` (`rpc.ts:742`): if `this.codec.snapshotState`, capture
    `{ id: this.codec.id, state: this.codec.snapshotState() }`.
 4. `restoreFromSnapshot()` (`rpc.ts:1309`): if `snapshot.codec` present, assert

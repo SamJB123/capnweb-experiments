@@ -35,53 +35,42 @@
   "publishConfig": {
     "access": "public"
   },
-  "workspaces": [
-    ".",
-    "packages/*",
-    "!packages/docs"
-  ],
+  "packageManager": "pnpm@10.15.1",
   "scripts": {
-    "build": "tsdown --config-loader native && node scripts/check-dist-ascii.mjs && npm run -w capnweb-validate build",
+    "build": "tsdown --config-loader native && node scripts/check-dist-ascii.mjs && pnpm --filter capnweb-validate build",
     "build:watch": "tsdown --config-loader native --watch",
-    "dev": "npm run build:watch",
-    "dev:docs": "npm run build && npm --prefix packages/docs run dev -- --port 4321",
+    "dev": "pnpm run build:watch",
+    "dev:docs": "pnpm --filter capnweb-docs dev",
+    "build:docs": "pnpm --filter capnweb-docs build",
+    "deploy:docs": "pnpm run build:docs && pnpm --filter capnweb-docs exec wrangler deploy",
     "lint:md": "markdownlint-cli2 && node scripts/align-markdown-tables.mjs --check",
     "lint:md:fix": "node scripts/align-markdown-tables.mjs && markdownlint-cli2 --fix",
-    "setup": "npm install && npm --prefix packages/docs install && npm --prefix examples/worker-react/client install",
     "test": "vitest run",
-    "test:hibernation": "npm --prefix ./hibernation-tests test",
     "test:bun": "bun test __tests__/bun.test.ts",
     "test:ci": "vitest run && bun test __tests__/bun.test.ts",
     "test:watch": "vitest",
-    "test:types": "tsc -p __type-tests__/tsconfig.json --noEmit",
-    "prepublishOnly": "npm run build"
+    "test:types": "tsc --project __type-tests__/tsconfig.json --noEmit",
+    "prepublishOnly": "pnpm run build",
+    "test:hibernation": "npm --prefix ./hibernation-tests test"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.5.2",
     "@changesets/cli": "^2.29.8",
     "@cloudflare/vitest-pool-workers": "^0.12.10",
-    "@cloudflare/workers-types": "^4.20260205.0",
+    "@cloudflare/workers-types": "^5.20260820.1",
     "@types/bun": "^1.2.0",
     "@types/ws": "^8.18.1",
     "@vitest/browser": "^3.2.7",
-    "cbor-x": "^1.6.5",
     "markdownlint-cli2": "^0.23.2",
     "pkg-pr-new": "^0.0.60",
-    "playwright": "^1.56.1",
+    "playwright": "1.56.1",
     "tsdown": "^0.22.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7",
-    "wrangler": "4.63.0",
-    "ws": "^8.21.1"
-  },
-  "peerDependencies": {
+    "wrangler": "4.125.0",
+    "ws": "^8.21.1",
     "cbor-x": "^1.6.5"
-  },
-  "peerDependenciesMeta": {
-    "cbor-x": {
-      "optional": true
-    }
   },
   "repository": {
     "type": "git",
@@ -90,5 +79,22 @@
   "bugs": {
     "url": "https://github.com/SamJB123/capnweb-experiments/issues"
   },
-  "homepage": "https://github.com/SamJB123/capnweb-experiments#readme"
+  "homepage": "https://github.com/SamJB123/capnweb-experiments#readme",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd",
+      "@parcel/watcher",
+      "cbor-extract"
+    ]
+  },
+  "peerDependencies": {
+    "cbor-x": "^1.6.5"
+  },
+  "peerDependenciesMeta": {
+    "cbor-x": {
+      "optional": true
+    }
+  }
 }
