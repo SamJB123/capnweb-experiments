@@ -1,5 +1,11 @@
 # capnweb
 
+## 0.12.0-hibernation.2
+
+### Hibernation fork
+
+- **Merged `0.12.0-hibernation-cbor.2`**: clean up released replay bases, skip missing-base records in older snapshots, and dispose partially restored sessions on failure. Preserve independently retained callback registrations after returned handles are released. See the experimental release entry below for details; no wire-format or snapshot-version change.
+
 ## 0.12.0-hibernation.1
 
 ### Hibernation fork
@@ -11,6 +17,17 @@
 ### Hibernation fork
 
 - **Merged upstream capnweb 0.12.0** (from the 0.10.0 base), via the `0.12.0-hibernation-cbor.0` experimental release. No new fork functionality: the optional CBOR codec was already part of this line (shipped on `latest` since `0.10.0-hibernation.1`). See the `0.12.0-hibernation-cbor.0` entry and the upstream 0.11.0–0.12.0 entries below for what changed.
+
+## 0.12.0-hibernation-cbor.2
+
+### Hibernation replay cleanup
+
+- Remove replay records whose negative export base is released, preventing stale calls from breaking the next wake.
+- Skip missing-base replay records in older snapshots while preserving valid replays.
+- Abort partially restored sessions when restoration throws, disposing exported hooks and pending replay results instead of leaking application registrations.
+- Preserve callback-bearing replays after their returned handles are released: return-value lifetime does not establish independently retained callback lifetime.
+
+Ports the corrected aicolab-portal pnpm patch into the fork source. No wire-format or snapshot-version change. This does not implement general replay garbage collection or the separate room-service document-writer ownership fix.
 
 ## 0.12.0-hibernation-cbor.1
 

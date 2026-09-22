@@ -688,7 +688,15 @@ class RpcSessionImpl implements Importer, Exporter {
 
     const snapshot = options.__experimental_restoreSnapshot;
     if (snapshot) {
-      this.restoreFromSnapshot(snapshot);
+      try {
+        this.restoreFromSnapshot(snapshot);
+      } catch (err) {
+        // Earlier replays may already have dispatched application calls. Dispose
+        // their export hooks, including pending results, before abandoning this
+        // half-built session. Otherwise registrations can survive a failed wake.
+        this.abort(err, false);
+        throw err;
+      }
     }
 
     this.readLoop().catch(err => this.abort(err));
@@ -842,6 +850,21 @@ class RpcSessionImpl implements Importer, Exporter {
       if (entry.hook) {
         this.reverseExports.delete(entry.hook);
         entry.hook.dispose();
+      }
+      // A released negative export cannot serve as a replay base on the next
+      // wake. Positive call-result bases have separate reconstruction metadata.
+      // Do not prune by producesExportIds: a call may retain a callback
+      // independently of every returned handle, even after those handles die.
+      if (exportId < 0 && this.importReplays.length > 0) {
+        const before = this.importReplays.length;
+        this.importReplays = this.importReplays.filter(
+          replay => pipelineBaseId(replay.expr) !== exportId);
+        if (this.importReplays.length !== before) {
+          this.trace("releaseExport.pruneImportReplays", {
+            exportId,
+            pruned: before - this.importReplays.length,
+          });
+        }
       }
     }
   }
@@ -1882,7 +1905,15 @@ class RpcSessionImpl implements Importer, Exporter {
     }
 
     if (snapshot.importReplays && snapshot.importReplays.length > 0) {
-      this.importReplays = snapshot.importReplays.map(cloneImportReplay);
+      // Older snapshots can contain replays whose base was already released.
+      // Exports and positive bases have been restored above; skip missing bases
+      // rather than letting one obsolete replay abort the whole session.
+      this.importReplays = snapshot.importReplays.map(cloneImportReplay).filter(replay => {
+        const baseId = pipelineBaseId(replay.expr);
+        if (baseId === undefined || this.exports[baseId]) return true;
+        this.trace("restoreFromSnapshot.importReplay.droppedMissingBase", { baseId });
+        return false;
+      });
       for (let replay of this.importReplays) {
         const producesExportIds = replay.producesExportIds ?? [];
         this.trace("restoreFromSnapshot.importReplay.begin", {
@@ -1946,6 +1977,13 @@ class RpcSessionImpl implements Importer, Exporter {
     }
     return new RpcStub(new RpcImportHook(false, entry));
   }
+}
+
+// The export-table base of a replay expression, if it has one.
+function pipelineBaseId(expr: unknown): number | undefined {
+  return expr instanceof Array && expr.length >= 2 &&
+    (expr[0] === "pipeline" || expr[0] === "import" || expr[0] === "remap") &&
+    typeof expr[1] === "number" ? expr[1] : undefined;
 }
 
 // Collects the ids of positive (call-result) exports that `value` references as pipeline /

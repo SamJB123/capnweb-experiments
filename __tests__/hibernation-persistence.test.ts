@@ -2420,3 +2420,139 @@ describe("pre-snapshot materialization of peer-held positive results", () => {
     expect(metrics.disposed).toEqual([]);
   });
 });
+
+// Regression coverage for the replay cleanup ported from aicolab-portal.
+class ReplayCleanupRoot extends RpcTarget {
+  callback?: RpcStub<LayeredParticipant>;
+  disposedLeases = 0;
+  claims = 0;
+
+  child(): ReplayCleanupChild { return new ReplayCleanupChild(); }
+
+  claim(callback: RpcStub<LayeredParticipant>): ReplayCleanupLease {
+    this.claims++;
+    this.callback = callback.dup();
+    return new ReplayCleanupLease(() => this.disposedLeases++);
+  }
+
+  async notify(value: string): Promise<void> {
+    await this.callback?.onMessage(value);
+  }
+
+  [Symbol.dispose](): void { this.callback?.[Symbol.dispose](); }
+}
+
+class ReplayCleanupChild extends RpcTarget {
+  listen(_callback: RpcStub<LayeredParticipant>): void {}
+}
+
+class ReplayCleanupLease extends RpcTarget {
+  constructor(private readonly onDispose: () => void) { super(); }
+  ping(): string { return "alive"; }
+  [Symbol.dispose](): void { this.onDispose(); }
+}
+
+async function connectReplayCleanup() {
+  const store = new CountingSessionStore();
+  const root = new ReplayCleanupRoot();
+  const { client, server } = createFakeWebSocketPair();
+  const session = await __experimental_newHibernatableWebSocketRpcSession(
+    server as unknown as WebSocket, root, { sessionStore: store });
+  if (!session) throw new Error("failed to create replay cleanup session");
+  server.addEventListener("message", event => session.handleMessage(event.data));
+  const api = newWebSocketRpcSession<ReplayCleanupRoot>(client as unknown as WebSocket);
+  return { store, root, client, session, api };
+}
+
+async function restoreReplayCleanup(
+    connection: Awaited<ReturnType<typeof connectReplayCleanup>>,
+    transform?: (snapshot: ReturnType<HibernatableWebSocketSession["__experimental_snapshot"]>) => void) {
+  const snapshot = structuredClone(connection.session.__experimental_snapshot());
+  transform?.(snapshot);
+  connection.store.snapshots.set(connection.session.sessionId, snapshot);
+  const server = new FakeWebSocket();
+  connection.client.connect(server);
+  server.connect(connection.client);
+  const root = new ReplayCleanupRoot();
+  const session = await __experimental_newHibernatableWebSocketRpcSession(
+    server as unknown as WebSocket, root,
+    { sessionStore: connection.store, sessionId: connection.session.sessionId });
+  if (session) server.addEventListener("message", event => session.handleMessage(event.data));
+  return { root, session, server };
+}
+
+describe("hibernation replay cleanup", () => {
+  it("prunes calls based on a released negative export and still wakes successfully", async () => {
+    const connection = await connectReplayCleanup();
+    try {
+      const child = await connection.api.child();
+      await child.listen(new LayeredParticipant());
+      expect(connection.session.__experimental_snapshot().importReplays).toHaveLength(1);
+      child[Symbol.dispose]();
+      await flush();
+      expect(connection.session.__experimental_snapshot().importReplays ?? []).toEqual([]);
+      const restored = await restoreReplayCleanup(connection);
+      expect(restored.session).toBeDefined();
+      const fresh = await connection.api.child();
+      await fresh.listen(new LayeredParticipant());
+      fresh[Symbol.dispose]();
+    } finally { connection.api[Symbol.dispose](); }
+  });
+
+  it("drops missing bases from old snapshots while retaining valid callback replays", async () => {
+    const connection = await connectReplayCleanup();
+    try {
+      const callback = new LayeredParticipant();
+      const lease = await connection.api.claim(callback);
+      const restored = await restoreReplayCleanup(connection, snapshot => {
+        snapshot.importReplays!.unshift({ expr: ["pipeline", -999, ["listen"], []] });
+      });
+      expect(restored.session).toBeDefined();
+      expect(restored.session!.__experimental_snapshot().importReplays).toHaveLength(1);
+      await connection.api.notify("after-wake");
+      expect(callback.messages).toEqual(["after-wake"]);
+      expect(await lease.ping()).toBe("alive");
+      lease[Symbol.dispose]();
+    } finally { connection.api[Symbol.dispose](); }
+  });
+
+  it("keeps an independently retained callback after all returned exports are released", async () => {
+    const connection = await connectReplayCleanup();
+    try {
+      const callback = new LayeredParticipant();
+      const lease = await connection.api.claim(callback);
+      lease[Symbol.dispose]();
+      await flush();
+      const snapshot = connection.session.__experimental_snapshot();
+      expect(snapshot.exports).toEqual([]);
+      expect(snapshot.importReplays).toHaveLength(1);
+      expect(snapshot.importReplays![0].producesExportIds?.length).toBeGreaterThan(0);
+      const restored = await restoreReplayCleanup(connection);
+      expect(restored.session).toBeDefined();
+      await connection.api.notify("still-registered");
+      expect(restored.root.claims).toBe(1);
+      expect(callback.messages).toEqual(["still-registered"]);
+    } finally { connection.api[Symbol.dispose](); }
+  });
+
+  it("disposes earlier replay results when a later replay aborts restoration", async () => {
+    const connection = await connectReplayCleanup();
+    try {
+      const lease = await connection.api.claim(new LayeredParticipant());
+      const restored = await restoreReplayCleanup(connection, snapshot => {
+        // The root base exists, but an argument references a missing export.
+        // This must fail AFTER the preceding valid claim was replayed.
+        snapshot.importReplays!.push({
+          expr: ["pipeline", 0, ["claim"], [["import", -999]]],
+        });
+      });
+      expect(restored.session).toBeUndefined();
+      await flush();
+      expect(restored.root.claims).toBe(1);
+      expect(restored.root.disposedLeases).toBe(1);
+      expect(restored.server.closeCount).toBeGreaterThan(0);
+      expect(connection.store.snapshots.has(connection.session.sessionId)).toBe(false);
+      lease[Symbol.dispose]();
+    } finally { connection.api[Symbol.dispose](); }
+  });
+});
