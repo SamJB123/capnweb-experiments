@@ -1,6 +1,8 @@
 # capnweb
 
-## Unreleased
+## 0.12.0-hibernation.3
+
+- Consolidate onto `main` and one npm `latest` release line, including optional CBOR support.
 
 - Merge upstream through `31f8edc`: RegExp serialization, source-preserving mapped types, pnpm workspace tooling, and updated Nimbus/MDX documentation.
 - Preserve native RegExp values in the fork's CBOR envelope optimizer, including structured-clone mode. All eight CBOR option combinations have round-trip coverage.
