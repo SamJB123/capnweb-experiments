@@ -41,6 +41,11 @@ permission to use it.
 npm i capnweb-experimental-hibernation
 ```
 
+This fork is maintained on `main` and uses one release line, published under npm's
+`latest` tag. Optional CBOR support is included in that release; JSON remains the default.
+The former `cbor-experiment` branch and separate `experimental` release track are retired.
+Previously published versions remain available.
+
 There is no build step, no schema compiler, and no code generation.
 
 ```js
