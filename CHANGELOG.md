@@ -1,5 +1,16 @@
 # capnweb
 
+## 0.12.0-hibernation-cbor.2
+
+### Hibernation replay cleanup
+
+- Remove replay records whose negative export base is released, preventing stale calls from breaking the next wake.
+- Skip missing-base replay records in older snapshots while preserving valid replays.
+- Abort partially restored sessions when restoration throws, disposing exported hooks and pending replay results instead of leaking application registrations.
+- Preserve callback-bearing replays after their returned handles are released: return-value lifetime does not establish independently retained callback lifetime.
+
+Ports the corrected aicolab-portal pnpm patch into the fork source. No wire-format or snapshot-version change. This does not implement general replay garbage collection or the separate room-service document-writer ownership fix.
+
 ## 0.12.0-hibernation-cbor.1
 
 ### CBOR experiment line
